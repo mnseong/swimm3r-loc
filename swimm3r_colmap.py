@@ -1247,6 +1247,8 @@ def main() -> None:
             print(f"       medium/:                 {os.path.join(args.outdir, 'medium')}/<stem>.npz")
     print()
     print(f"[viewer] python utils/viewer_viser.py --model swimm3r:{args.outdir}")
+    if torch.cuda.is_available():
+        print(f"[memory] peak GPU memory of the mapping {torch.cuda.max_memory_allocated() / 2 ** 30:.2f} GiB", flush=True)
 
 
 if __name__ == "__main__":

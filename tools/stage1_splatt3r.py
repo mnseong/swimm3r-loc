@@ -497,7 +497,13 @@ def main():
                 m0 = medium_for(mode, num, p0)
                 with torch.no_grad():
                     before = score(render(p0, m0, t=num / args.fps), gt)
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                tl = time.time()
                 p1 = refine(p0, gt, m0, t=num / args.fps)
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                tl = time.time() - tl
                 with torch.no_grad():
                     m1 = medium_for(mode, num, p1)
                     pred = render(p1, m1, t=num / args.fps)
@@ -511,7 +517,8 @@ def main():
                         Image.fromarray((row.permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)).save(
                             os.path.join(args.out_dir, "%s_gt_underwater_restored%s.jpg" % (os.path.splitext(name)[0], sfx[mode])),
                             quality=92)
-                rows.append({"frame": num, "centre": num in centre, "dist": min(abs(num - k) for k in fnums), "before": before, "after": after})
+                rows.append({"frame": num, "centre": num in centre, "dist": min(abs(num - k) for k in fnums), "before": before, "after": after,
+                             "seconds": tl})
                 print("%06d %s%s before %.2f / %.4f / %.4f after %.2f / %.4f / %.4f" % (
                     num, "centre" if num in centre else "side  ", tag[mode], *before, *after), flush=True)
 
@@ -527,6 +534,11 @@ def main():
                 if a:
                     print("[%s%s] n %d | underwater before %.3f / %.4f / %.4f after %.3f / %.4f / %.4f" % (
                         k, tag[mode], a["n"], *a["before"], *a["after"]))
+            sec = [r["seconds"] for r in rows]
+            out["loc_seconds" + s] = {"mean": float(np.mean(sec)), "median": float(np.median(sec)), "max": float(np.max(sec)),
+                                      "frames": len(sec), "steps": int(args.pose_iters)}
+            print("[time%s] pose refinement of one held out frame: mean %.2f s, median %.2f s, max %.2f s over %d frames (%d steps each)" % (
+                tag[mode], np.mean(sec), np.median(sec), np.max(sec), len(sec), args.pose_iters), flush=True)
     u8 = lambda c: (c.clamp(0, 1) * 255).round().byte().cpu().numpy()
     extra = {k: g[k].detach().float().cpu().numpy() for k in ("beta", "gate", "tw", "tb", "vel", "t_src") if k in g}
     np.savez_compressed(os.path.join(args.out_dir, "map.npz"), xyz=g["xyz"].float().cpu().numpy(),
@@ -534,6 +546,9 @@ def main():
                         opacity=g["opacity"].reshape(-1).half().cpu().numpy(), color_raw=u8(g["raw"]), color_clean=u8(g["J"]),
                         kf_c2w=c2w.cpu().numpy(), frame_c2w=c2w.cpu().numpy(), focal=np.float32(focal), pp=np.float32(pp),
                         hw=np.int32([h, w]), kernel="beta" if "beta" in g else "gauss", restored="swimm3r_stage1", **extra)
+    if dev.type == "cuda":
+        out["gpu_peak_gib"] = torch.cuda.max_memory_allocated() / 2 ** 30
+        print(f"[memory] peak GPU memory of the map and the localization {out['gpu_peak_gib']:.2f} GiB", flush=True)
     out["seconds_total"] = time.time() - t0
     json.dump(out, open(os.path.join(args.out_dir, "scores.json"), "w"), indent=1)
     print(f"[done] {args.out_dir}/scores.json and map.npz in {out['seconds_total']:.0f}s", flush=True)
