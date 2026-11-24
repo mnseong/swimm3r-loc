@@ -221,8 +221,9 @@ def report(res, info):
         torch.__version__, " | CUDA " + str(torch.version.cuda) if torch.version.cuda else ""))
     L.append(" scene       %s | %d map frames | %d held-out frames | %d x %d" % (
         info["scene"], info["map_frames"], res["frames"], info["hw"][0], info["hw"][1]))
-    L.append(" map         %.2f M Gaussians | %.1f MB as float32 tensors | map.npz %.1f MB" % (
-        info["primitives"] / 1e6, info["primitives"] * 56 / 1e6, info["map_file_mb"]))
+    L.append(" map         %.2f M primitives (%s kernel%s) | %.1f MB as float32 tensors | map.npz %.1f MB" % (
+        info["primitives"] / 1e6, info["kernel"], ", static part and dynamic copy per slot" if info["dynamic"] else "",
+        info["map_mb"], info["map_file_mb"]))
     if info.get("mapping_seconds"):
         L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization" % (
             info["mapping_seconds"], info["map_frames"], info["mapping_seconds"] / info["map_frames"]))

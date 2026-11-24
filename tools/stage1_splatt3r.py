@@ -569,6 +569,8 @@ def main():
         mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
         text = bench_loc.report(res, dict(
             scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]), warmup=args.bench_warmup,
+            kernel="Beta" if "beta" in g else "Gaussian", dynamic="gate" in g,
+            map_mb=sum(g[k].numel() for k in ("xyz", "scales", "quat", "opacity", "J", "beta", "gate", "tw", "tb", "vel", "t_src") if k in g) * 4 / 1e6,
             map_file_mb=mb(os.path.join(args.out_dir, "map.npz")), mapping_seconds=args.bench_mapping_seconds,
             weights_mb={"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}))
         open(os.path.join(args.out_dir, "benchmark.txt"), "w").write(text + "\n")
