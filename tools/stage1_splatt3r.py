@@ -131,6 +131,15 @@ def main():
                          "map covers (alpha > 0.5) and on the rest, the share of the squared error in uncovered pixels, the fused "
                          "map with the medium of the two nearest other frames, and the water alone (B_inf, no Gaussians)")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--bench", action="store_true",
+                    help="benchmark of the localization in place of the standard evaluation of the held out frames "
+                         "(tools/bench_loc.py): tracking FPS at several numbers of pose steps, rendering FPS and the memory "
+                         "footprint, printed as one table and saved as benchmark.txt")
+    ap.add_argument("--bench_steps", type=int, nargs="+", default=[10, 25, 50, 100, 200, 300])
+    ap.add_argument("--bench_init", nargs="+", choices=("interp", "motion"), default=["interp", "motion"])
+    ap.add_argument("--bench_render_reps", type=int, default=5)
+    ap.add_argument("--bench_warmup", type=int, default=2)
+    ap.add_argument("--bench_mapping_seconds", type=float, default=None)
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     dev = torch.device(args.device)
@@ -480,7 +489,7 @@ def main():
               f"squared error uncovered | on the single view cover: fused {dmean['fused_on_single_cover']:.2f} single "
               f"{dmean['single_on_single_cover']:.2f} | medium of the nearest other frames {dmean['fused_nearest_other_medium']:.2f}", flush=True)
 
-    if args.data_dir:
+    if args.data_dir and not args.bench:
         split = json.load(open(os.path.join(args.data_dir, "split.json")))
         centre = set(E.fnum(x) for x in split.get("centre_files", []))
         tests = sorted(split["test_files"], key=E.fnum)
@@ -546,12 +555,32 @@ def main():
                         opacity=g["opacity"].reshape(-1).half().cpu().numpy(), color_raw=u8(g["raw"]), color_clean=u8(g["J"]),
                         kf_c2w=c2w.cpu().numpy(), frame_c2w=c2w.cpu().numpy(), focal=np.float32(focal), pp=np.float32(pp),
                         hw=np.int32([h, w]), kernel="beta" if "beta" in g else "gauss", restored="swimm3r_stage1", **extra)
+    text = None
+    if args.bench and args.data_dir:
+        import bench_loc
+        tests = sorted(json.load(open(os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)
+        poses_np = c2w.cpu().numpy().astype(np.float64)
+        res = bench_loc.run(dict(
+            dev=dev, tests=tests, steps=args.bench_steps, inits=args.bench_init, fps=args.fps, unit=unit, lr=args.pose_lr,
+            warmup=args.bench_warmup, render_reps=args.bench_render_reps, map_nums=fnums, map_poses=poses_np,
+            interp=E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums),
+            load=lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev),
+            medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score))
+        mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
+        text = bench_loc.report(res, dict(
+            scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]), warmup=args.bench_warmup,
+            map_file_mb=mb(os.path.join(args.out_dir, "map.npz")), mapping_seconds=args.bench_mapping_seconds,
+            weights_mb={"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}))
+        open(os.path.join(args.out_dir, "benchmark.txt"), "w").write(text + "\n")
+        out["bench"] = res
     if dev.type == "cuda":
-        out["gpu_peak_gib"] = torch.cuda.max_memory_allocated() / 2 ** 30
+        out["gpu_peak_gib"] = max(torch.cuda.max_memory_allocated() / 2 ** 30, out.get("bench", {}).get("memory", {}).get("gpu_peak_gib", 0.0))
         print(f"[memory] peak GPU memory of the map and the localization {out['gpu_peak_gib']:.2f} GiB", flush=True)
     out["seconds_total"] = time.time() - t0
     json.dump(out, open(os.path.join(args.out_dir, "scores.json"), "w"), indent=1)
     print(f"[done] {args.out_dir}/scores.json and map.npz in {out['seconds_total']:.0f}s", flush=True)
+    if text:
+        print(text, flush=True)
 
 
 if __name__ == "__main__":

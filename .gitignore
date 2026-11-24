@@ -2,4 +2,5 @@ out/
 __pycache__/
 *.pyc
 *.so
-ubs/submodules/build/
+*.egg-info/
+third_party/diff_gauss_pose/build/
