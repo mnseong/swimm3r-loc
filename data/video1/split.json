@@ -1,10 +1,10 @@
 {
- "split_mode": "periodic_segment3",
+ "split_mode": "periodic_segment3_interior",
  "period": 8,
  "guard_frames": 1,
  "n_train_views": 73,
- "n_test_views": 44,
- "n_dropped_views": 0,
+ "n_test_views": 42,
+ "n_dropped_views": 2,
  "keep_test_cameras": false,
  "all_files": [
   "000000.jpg",
@@ -201,8 +201,6 @@
   "000116.jpg"
  ],
  "test_files": [
-  "000000.jpg",
-  "000001.jpg",
   "000007.jpg",
   "000008.jpg",
   "000009.jpg",
@@ -246,9 +244,11 @@
   "000112.jpg",
   "000113.jpg"
  ],
- "dropped_files": [],
- "centre_files": [
+ "dropped_files": [
   "000000.jpg",
+  "000001.jpg"
+ ],
+ "centre_files": [
   "000008.jpg",
   "000016.jpg",
   "000024.jpg",
