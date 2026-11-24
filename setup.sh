@@ -11,7 +11,7 @@ export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
 export MAX_JOBS="${MAX_JOBS:-6}"
 cd "$D/third_party/diff_gauss_pose"
 rm -rf build *.egg-info
-python -m pip install --no-deps --no-build-isolation .
+python -m pip install --no-deps --no-build-isolation --force-reinstall .
 cd "$D"
 python -c "
 import diff_gauss_pose
