@@ -18,5 +18,5 @@ if [ ! -f "$O/map/mapping_seconds" ]; then
   echo $(( $(date +%s) - T0 )) > "$O/map/mapping_seconds"
 fi
 python tools/stage1_splatt3r.py --scene_dir "$O/map" --data_dir data/video1 --lora $W/0019_lora.pth --physics $W/0019_physics.pth \
-  --head $W/0019_splatt3r.pth "${LOC[@]}" --medium nearest --out_dir "$O/loc" --bench \
+  --head $W/0019_splatt3r.pth "${LOC[@]}" --medium field --out_dir "$O/loc" --bench \
   --bench_mapping_seconds "$(cat "$O/map/mapping_seconds")" "${@:3}"

@@ -113,7 +113,7 @@ def main():
     ap.add_argument("--pose_iters", type=int, default=300)
     ap.add_argument("--pose_lr", type=float, default=8e-4)
     ap.add_argument("--save_images", type=int, default=8)
-    ap.add_argument("--medium", choices=("nearest", "field", "views", "both", "all"), default="nearest",
+    ap.add_argument("--medium", choices=("nearest", "field", "views", "both", "all"), default="field",
                     help="medium of a held out view: the mean of the two map frames nearest in frame number (nearest), "
                          "the medium field fitted to the map frames (field, model/medium_field.py, saved as "
                          "medium_field.pt), the B_inf maps of the map frames that saw each ray direction with no fitting "
