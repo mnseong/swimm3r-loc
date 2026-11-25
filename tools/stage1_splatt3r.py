@@ -346,8 +346,9 @@ def main():
     modes = [m for m in want if m == "nearest" or (m == "field" and field is not None) or (m == "views" and views is not None)]
     if not modes:
         modes = ["nearest"]
-    sfx = {"nearest": "", "field": "_field", "views": "_views"}
-    tag = {"nearest": "", "field": " field", "views": " views"}
+    sfx = {m: ("" if m == modes[0] else "_" + m) for m in ("nearest", "field", "views")}
+    tag = {m: ("" if m == modes[0] else " " + m) for m in ("nearest", "field", "views")}
+    print(f"[medium] held out views use {modes[0]}" + (f", also scored with {', '.join(modes[1:])}" if len(modes) > 1 else ""), flush=True)
 
     def medium_for(mode, num, pose, f=focal, c=pp):
         if mode == "field":
@@ -423,7 +424,7 @@ def main():
 
     out = {"scene": args.scene_dir, "head": src, "lora": args.lora, "physics": args.physics, "frames_in_map": n,
            "primitives_before_fusion": n_in, "primitives": g["n_out"], "seconds_map": t_map, "stage1_restored_frames": n_s1,
-           "beta_D_scale": args.phys_beta_D_scale, "medium": modes, "medium_field": medium_info,
+           "beta_D_scale": args.phys_beta_D_scale, "medium": modes, "medium_primary": modes[0], "medium_field": medium_info,
            "scaffold_mode": None if anchor is None or not getattr(anchor, "scaffold", False) else ("always on" if anchor.cfg.get("always_on") else anchor.mode),
            "beta_fixed": float(getattr(anchor, "cfg", {}).get("beta_fixed", 0.0) or 0.0) if anchor is not None else 0.0}
     with torch.no_grad():
