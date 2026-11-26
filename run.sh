@@ -28,7 +28,14 @@ if [ "$EVERY" != 0 ]; then
   python -c "import json,sys; d=sys.argv[1]; a=[l.strip() for l in open(d+'/all.txt') if l.strip()]; m=set(l.strip() for l in open(d+'/frames.txt')); json.dump({'test_files':[x for x in a if x not in m],'centre_files':[]}, open(d+'/split.json','w'))" "$MP"
   echo "mapping frames: $(wc -l < "$MP/frames.txt") of $(wc -l < "$MP/all.txt") (every ${EVERY} of all frames), the other $(( $(wc -l < "$MP/all.txt") - $(wc -l < "$MP/frames.txt") )) are queries, pair window $WIN"
   EXTRA=(--split_json "$MP/split.json")
-  if [ "$EVERY" != 1 ] && [ -f "$OUT/map${TAG}_all/scene.pkl" ]; then EXTRA+=(--proto_ref_scene "$OUT/map${TAG}_all"); fi
+  if [ "$EVERY" != 1 ]; then
+    if [ ! -f "$OUT/map${TAG}_all/scene.pkl" ]; then
+      echo "the mapping of all frames, the reference of the sparse maps, is missing: it is made first (EVERY=1)"
+      EVERY=1 bash "$D/run.sh" "$M" "$OUT"
+    fi
+    [ -f "$OUT/map${TAG}_all/scene.pkl" ] || { echo "no reference mapping at $OUT/map${TAG}_all, stopped"; exit 1; }
+    EXTRA+=(--proto_ref_scene "$OUT/map${TAG}_all" --proto_ref_frames 2)
+  fi
 else
   if [ "$STRIDE" = 1 ] && [ "$WIN" = 5 ]; then MP="$OUT/map$TAG"; O="$OUT/$M$TAG"; else MP="$OUT/map${TAG}_s${STRIDE}w${WIN}"; O="$OUT/${M}${TAG}_s${STRIDE}w${WIN}"; fi
   mkdir -p "$MP" "$O"
