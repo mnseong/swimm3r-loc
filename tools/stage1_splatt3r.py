@@ -233,6 +233,11 @@ def main():
     ap.add_argument("--gscpe_no_ablation", action="store_true", help="--gscpe: leave out the rows without the pyramid, the mask and the water model")
     ap.add_argument("--gscpe_depth_m", type=float, default=None,
                     help="--gscpe: median depth of the map in metres when it is known, the table is then also given in cm")
+    ap.add_argument("--map_holdout", default=None,
+                    help="ground truth as GS-CPE takes it (COLMAP or SLAM poses of all images, the map trained on the training images only): "
+                         "--scene_dir is the Stage 1 output of all frames, the test_files of this split are left out of the Gaussian map, "
+                         "the medium field and the store of map frames, and their own poses in that same reconstruction are the reference "
+                         "of --gscpe and --proto (same frame and intrinsics, nothing moved between reconstructions)")
     ap.add_argument("--proto_ref_poses", default=None,
                     help="--proto and --gscpe: reference poses of all frames from another reconstruction, a COLMAP model (folder, images.bin "
                          "or images.txt) or a json of name to camera to world 4 x 4, moved into this map like --proto_ref_scene")
@@ -244,6 +249,22 @@ def main():
 
     sc = E.load_scene(args.scene_dir, dev)
     names, imgs, depth, conf, intr, c2w = sc["names"], sc["imgs"], sc["depth"], sc["conf"], sc["intr"], sc["c2w"]
+    held_ref, held_info = None, None
+    if args.map_holdout:
+        hold = set(json.load(open(args.map_holdout))["test_files"])
+        keep = [i for i, nm in enumerate(names) if nm not in hold]
+        held = [i for i, nm in enumerate(names) if nm in hold]
+        if len(keep) < 3 or not held:
+            ap.error(f"--map_holdout leaves {len(keep)} map frames and {len(held)} queries in {args.scene_dir}")
+        held_ref = {names[i]: c2w[i].detach().cpu().numpy().astype(np.float64) for i in held}
+        held_info = dict(map_frames=len(keep), queries=len(held), focal_map=float(intr[keep, 0, 0].median()),
+                         focal_queries=float(intr[held, 0, 0].median()))
+        kk = torch.as_tensor(keep, device=imgs.device)
+        names = [names[i] for i in keep]
+        imgs, depth, conf, intr, c2w = imgs[kk], depth[kk], conf[kk], intr[kk], c2w[kk]
+        print(f"[holdout] {len(held)} queries of {args.map_holdout} left out of the map of {args.scene_dir}: {len(keep)} map frames build the "
+              f"Gaussians, the medium field and the store; the reference is the pose of every query in this same reconstruction (focal of the "
+              f"map frames {held_info['focal_map']:.2f}, of the queries {held_info['focal_queries']:.2f})", flush=True)
     n, _, h, w = imgs.shape
     diag_idx = sorted(set(np.linspace(0, n - 1, args.diag).round().astype(int).tolist())) if args.diag > 0 else []
     from model.lora_model import LoRAMast3r
@@ -887,7 +908,13 @@ def main():
         loc = loc_ff.Localizer(net, feat, depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev, subsample=args.loc_subsample,
                                reproj=args.loc_reproj)
         ref_poses, ref_fit, ref_text, ref_src = None, None, None, None
-        if args.proto_ref_poses:
+        if held_ref is not None:
+            ref_poses = {k: v for k, v in held_ref.items() if k in set(tests)}
+            ref_fit = dict(same=True, n=int(held_info["map_frames"]), focal_map=held_info["focal_map"], focal_queries=held_info["focal_queries"])
+            ref_text = ("poses of the queries in the same Stage 1 reconstruction of all frames as the map (as GS-CPE takes the COLMAP or SLAM poses "
+                        "of all images); the queries are left out of the Gaussian map, the medium field and the retrieval store")
+            ref_src = (None, None, args.map_holdout, ref_text)
+        elif args.proto_ref_poses:
             rn, rp = loc_geom.read_poses(args.proto_ref_poses)
             ref_src = (rn, rp, args.proto_ref_poses, "poses of an external reconstruction of all frames, the queries included (%s)" % args.proto_ref_poses)
         elif args.proto_ref_scene:
@@ -897,7 +924,7 @@ def main():
             ref_src = ([os.path.basename(q) for q in rs.img_paths], rs.cam2w.detach().float().cpu().numpy(), args.proto_ref_scene,
                        "poses of an offline mapping of all frames by the same model (map frames and queries together), no external reconstruction")
             del rs
-        if ref_src is not None:
+        if ref_src is not None and held_ref is None:
             got = loc_geom.transfer_poses(ref_src[0], ref_src[1], list(names), poses_np, tests)
             if got is None:
                 print("[proto] the reference shares fewer than 3 frames with this map, the reference is made on this map", flush=True)
@@ -953,6 +980,7 @@ def main():
             gtext = bench_gscpe.report(gres, dict(
                 scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
                 mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,
+                mapping_frames=n + (held_info["queries"] if held_info else 0),
                 split="test : train = 1 : %.1f" % (n / max(len(tests), 1)))) + tail
             open(os.path.join(args.out_dir, "gscpe.txt"), "w").write(gtext + "\n")
             out["gscpe"] = gres

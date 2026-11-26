@@ -302,15 +302,22 @@ def report(res, info):
         info["primitives"] / 1e6, info["map_mb"], st["tokens"], st["points"]))
     L.append(" model       %s" % info["model"])
     if info.get("mapping_seconds"):
-        L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization" % (
-            info["mapping_seconds"], info["map_frames"], info["mapping_seconds"] / info["map_frames"]))
+        mf = int(info.get("mapping_frames") or info["map_frames"])
+        L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization%s" % (
+            info["mapping_seconds"], mf, info["mapping_seconds"] / mf,
+            "; the poses of the queries come from this same reconstruction" if mf != info["map_frames"] else ""))
     f = res.get("fit") or {}
-    L += ["-" * W, " Reference   %s" % (info.get("reference") or "poses of a reconstruction of all frames, the queries included"),
-          "             moved into the map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ by a median of" % (
-              f.get("n", 0), f.get("scale", float("nan"))),
-          "             %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), the floor of every pose error below.%s" % (
-              f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")),
-              " %d queries without a reference pose are left out." % res["skipped"] if res.get("skipped") else "")]
+    L += ["-" * W, " Reference   %s" % (info.get("reference") or "poses of a reconstruction of all frames, the queries included")]
+    if f.get("same"):
+        L.append("             same frame and intrinsics as the map, nothing moved between reconstructions (focal of the map frames %.2f, of the queries %.2f).%s" % (
+            f.get("focal_map", float("nan")), f.get("focal_queries", float("nan")),
+            " %d queries without a reference pose are left out." % res["skipped"] if res.get("skipped") else ""))
+    else:
+        L += ["             moved into the map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ by a median of" % (
+                  f.get("n", 0), f.get("scale", float("nan"))),
+              "             %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), the floor of every pose error below.%s" % (
+                  f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")),
+                  " %d queries without a reference pose are left out." % res["skipped"] if res.get("skipped") else "")]
     df = res.get("difficulty") or {}
     if df.get("t") is not None:
         L.append(" Queries     a median of %.1f %% of depth and %.1f deg from the nearest map frame (largest %.1f %%, %.1f deg), the map frames near it see %.0f %% of the view" % (

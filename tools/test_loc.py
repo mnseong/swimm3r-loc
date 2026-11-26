@@ -250,6 +250,8 @@ def check_gscpe():
     dry = row("no water model: coarse")
     assert seen["restored"] > 4 * len(hold) and (dry["t"], dry["r"]) != (a1["t"], a1["r"]), (seen, dry, a1)
     assert row("public MASt3R matcher: coarse")["acc"][1] == 100.0 and "stages_public" in res
+    same = C.report(dict(res, fit=dict(same=True, n=len(mapf), focal_map=FOCAL, focal_queries=FOCAL)), dict(info, mapping_seconds=10.0, mapping_frames=len(mapf) + len(hold)))
+    assert "same frame and intrinsics as the map" in same and "moved into the map" not in same and "come from this same reconstruction" in same
     short = C.run(dict(ctx, out_dir=tempfile.mkdtemp(), ablation=False, loc_public=None, depth_m=None, coarse_iters=1, score=None))
     short_text = C.report(short, info)
     assert [r["label"] for r in short["rows"]] == labels[:4] and "the same in cm" not in short_text and short["stages"]["iters"] == 1.0
