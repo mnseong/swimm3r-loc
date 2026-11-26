@@ -207,6 +207,9 @@ def main():
     ap.add_argument("--proto_rc_steps", type=int, nargs="+", default=[10, 25, 50, 100, 300])
     ap.add_argument("--proto_ff_steps", type=int, nargs="+", default=[5, 10, 25])
     ap.add_argument("--proto_topk", type=int, nargs="+", default=[1, 3])
+    ap.add_argument("--proto_strides", type=int, nargs="*", default=[4, 8], help="--proto: the store of map frames thinned to every Nth")
+    ap.add_argument("--proto_only_thinned", action="store_true", help="--proto: only the reference (read back when it exists) and the thinned map tasks")
+    ap.add_argument("--proto_gaps", type=int, nargs="*", default=[8, 16], help="--proto: stretches of this many frames taken out of the store")
     ap.add_argument("--proto_ref_steps", type=int, default=200)
     ap.add_argument("--proto_ref_check", type=int, default=300)
     ap.add_argument("--proto_ref_frames", type=int, default=6)
@@ -862,7 +865,8 @@ def main():
             out_dir=args.out_dir, rc_steps=[k for k in args.proto_rc_steps if not quick or k <= 100], ff_steps=args.proto_ff_steps,
             topk=args.proto_topk, ref_steps=min(args.proto_ref_steps, 100) if quick else args.proto_ref_steps,
             ref_check=min(args.proto_ref_check, 200) if quick else args.proto_ref_check, ref_frames=args.proto_ref_frames,
-            ref_tol=args.proto_ref_tol, px_tol=args.proto_px, levels=bench_proto.LEVELS[:2] if quick else bench_proto.LEVELS))
+            ref_tol=args.proto_ref_tol, px_tol=args.proto_px, levels=bench_proto.LEVELS[:2] if quick else bench_proto.LEVELS,
+            map_names=list(names), strides=args.proto_strides, gaps=args.proto_gaps, only_thinned=args.proto_only_thinned))
         mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
         n_far = int(g_far["n_out"]) if g_far is not None else 0
         n_win = int(sum(m_["n_out"] for _, m_ in tmaps)) if tmaps else 0

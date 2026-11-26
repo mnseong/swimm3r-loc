@@ -141,7 +141,8 @@ def main():
     ctx = dict(dev=dev, tests=tests, centre=[name(i) for i in centre], fps=5.0, unit=1.0, lr=4e-3, warmup=1, map_nums=map_nums, map_poses=poses_np,
                interp=E.interpolate_poses(poses_np, test_nums, map_nums), load=load, medium=lambda num, pose: {}, render=render, score=score,
                loc=loc, loc_public=loc, out_dir=out_dir, rc_steps=[5, 20, 60], ff_steps=[5, 10], topk=[1, 3], ref_steps=40, ref_check=120,
-               ref_frames=4, ref_tol=1.0, px_tol=1.0, conv_ff_steps=5, conv_rc_steps=40, reloc_rc_max=20, levels=((2.0, 1.0), (10.0, 5.0)))
+               ref_frames=4, ref_tol=1.0, px_tol=1.0, conv_ff_steps=5, conv_rc_steps=40, reloc_rc_max=20, levels=((2.0, 1.0), (10.0, 5.0)),
+               map_names=[name(i) for i in map_nums], strides=[2, 4], gaps=[8])
     res = P.run(ctx)
     text = P.report(res, dict(scene="synthetic scene", map_frames=len(map_nums), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in",
                               public=True, mapping_seconds=None, weights_mb={"none": 0.0}, warmup=1))
@@ -166,6 +167,15 @@ def main():
     assert row("tracking", "render and compare 60")["lpips"] <= row("tracking", "start pose, no computation")["lpips"] + 1e-6
     again = P.run(dict(ctx, only_reference=True))
     assert again["reference"]["seconds"] == 0.0 and again["reference"]["verified"] == res["reference"]["verified"]
+    th = res["sparse"]
+    assert [x["stride"] for x in th["strides"]] == [2, 4] and th["strides"][0]["all"]["sp"] >= 90.0 and th["strides"][1]["all"]["n"] > th["strides"][0]["all"]["n"], th["strides"]
+    assert th["gaps"] and th["gaps"][0]["all"]["n"] >= 4 and "Thinned map" in text, th["gaps"]
+    hard = P.run(dict(ctx, only_thinned=True, strides=[12], gaps=[24], accept_inliers=2000))
+    assert not hard["tracking"] and hard["sparse"]["strides"][0]["all"]["again"] == 100.0 and hard["sparse"]["strides"][0]["all"]["accepted_good"] == 0.0, hard["sparse"]
+    hard_text = P.report(hard, dict(scene="synthetic scene", map_frames=len(map_nums), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in",
+                                    public=False, mapping_seconds=None, weights_mb={"none": 0.0}, warmup=1))
+    assert "Thinned map" in hard_text and "Tracking " not in hard_text
+    print(hard_text[hard_text.index(" Thinned map"):hard_text.index(" Footprint")])
     print("test_loc ok")
 
 

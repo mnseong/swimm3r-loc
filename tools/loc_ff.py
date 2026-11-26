@@ -56,6 +56,19 @@ class Localizer:
         self.reproj = float(reproj) if reproj else 0.008 * float(np.hypot(h, w))
         self.pos = None
 
+    def sub(self, keep):
+        import copy
+        keep = [int(i) for i in keep]
+        ii = torch.as_tensor(keep, device=self.dev, dtype=torch.long)
+        o = copy.copy(self)
+        o.n = len(keep)
+        o.tokens, o.xyz, o.valid, o.c2w = self.tokens[ii], self.xyz[ii], self.valid[ii], self.c2w[ii]
+        o.poses, o.depths, o.kd = self.poses[keep], self.depths[keep], self.kd[ii]
+        o.centres, o.forward = o.c2w[:, :3, 3], o.c2w[:, :3, 2]
+        o.points = [self.points[i] for i in keep]
+        o.pos = None
+        return o
+
     def megabytes(self):
         return {"tokens": self.tokens.numel() * self.tokens.element_size() / 1e6, "points": self.xyz.numel() * 4 / 1e6}
 
