@@ -80,7 +80,8 @@ def _frames(nsum, view, xsum):
     return torch.stack([t1, t2, n], dim=-1)
 
 
-def build_anchors(xyz, fp, conf, cam, camx, nrm, vid, feat, J, raw, anchor_px, quadrants=False, cells=2, times=None):
+def build_anchors(xyz, fp, conf, cam, camx, nrm, vid, feat, J, raw, anchor_px, quadrants=False, cells=2, times=None, detail=0,
+                  detail_frac=0.0):
     """Anchors of the lifted pixels. xyz (N, 3) points, fp (N) footprints (depth / focal), conf (N) confidence on
     the Stage 1 scale, cam and camx (N, 3) centre and x axis of the camera of the pixel, nrm (N, 3) pixel normal
     (zero where none), vid (N) view index, feat (N, C), J and raw (N, 3) restored and underwater colours. Features
@@ -89,7 +90,13 @@ def build_anchors(xyz, fp, conf, cam, camx, nrm, vid, feat, J, raw, anchor_px, q
     -0.5 + k / cells (cells 2 splits at the centroid), cell index iu + cells iv: q_count (M, K) pixels, q_share (M, K)
     share of the anchor weight, q_uvn and q_sd (M, K, 3) weighted mean and spread of the frame coordinates in edges,
     q_feat (M, K, C), q_J and q_raw (M, K, 3), K = cells^2. With times (N,), the capture time of every pixel in
-    seconds, also t (M,) and with quadrants q_t (M, K), the weighted mean times of the anchors and of their cells."""
+    seconds, also t (M,) and with quadrants q_t (M, K), the weighted mean times of the anchors and of their cells.
+    With quadrants, detail = S > 0 and detail_frac > 0 the cells with the most colour detail are split once more into
+    S x S fine cells: q_gain (M, K) is the variance of the underwater colour between the fine cells of a cell (what
+    one flat colour per cell loses), q_detail (M, K) marks the detail_frac of the occupied cells with the largest gain,
+    and for the D occupied fine cells of the marked cells d_anchor and d_cell (D,) anchor and cell index, d_count,
+    d_share (share of the anchor weight), d_uvn and d_sd (D, 3), d_feat (D, C), d_J and d_raw (D, 3) and with times
+    d_t (D,), pooled as the cells are."""
     with torch.no_grad():
         fp_ref = fp.median().clamp_min(1e-9)
         level = torch.round(torch.log2((fp / fp_ref).clamp_min(1e-6))).clamp(-LEVELS, LEVELS).long()
@@ -162,6 +169,47 @@ def build_anchors(xyz, fp, conf, cam, camx, nrm, vid, feat, J, raw, anchor_px, q
         if times is not None:
             with torch.no_grad():
                 out["q_t"] = qmean(times.float()[:, None])[..., 0]
+        if int(detail) > 0 and float(detail_frac) > 0.0:
+            S = int(detail)
+            with torch.no_grad():
+                s2 = cells * S
+                fu = torch.floor((loc[:, 0] + 0.5) * s2).clamp(0, s2 - 1).long()
+                fv = torch.floor((loc[:, 1] + 0.5) * s2).clamp(0, s2 - 1).long()
+                uf, invf = torch.unique(key * (S * S) + (fu % S) + S * (fv % S), return_inverse=True)
+                nf = uf.numel()
+                ckey = uf // (S * S)
+                wf_sum = torch.zeros(nf, device=xyz.device, dtype=w.dtype).index_add_(0, invf, w)
+                wf = w / wf_sum[invf]
+                rawf = torch.zeros(nf, 3, device=xyz.device).index_add_(0, invf, raw.float() * wf[:, None].float())
+                rawc = torch.zeros(K * m, 3, device=xyz.device).index_add_(0, key, raw.float() * wq[:, None].float())
+                gain = torch.zeros(K * m, device=xyz.device).index_add_(
+                    0, ckey, (wf_sum / wq_sum[ckey]).float() * (rawf - rawc[ckey]).square().mean(-1))
+                occ = qn > 0
+                n_pick = min(int(occ.sum()), max(1, int(round(float(detail_frac) * int(occ.sum())))))
+                thr = torch.topk(gain[occ], n_pick).values[-1]
+                pick = occ & (gain >= thr) & (gain > 0)
+                keepf = pick[ckey]
+                newid = torch.cumsum(keepf.long(), 0) - 1
+                pix = keepf[invf]
+                pid = newid[invf[pix]]
+                nd = int(keepf.sum())
+                wd = wf[pix]
+                dkey = ckey[keepf]
+                locd = loc[pix]
+                duvn = torch.zeros(nd, 3, device=xyz.device, dtype=loc.dtype).index_add_(0, pid, locd * wd[:, None].to(loc.dtype))
+                d2 = torch.zeros(nd, 3, device=xyz.device, dtype=loc.dtype).index_add_(0, pid, locd * locd * wd[:, None].to(loc.dtype))
+                dn = torch.zeros(nd, device=xyz.device).index_add_(0, pid, torch.ones(pid.numel(), device=xyz.device))
+
+            def dmean(a):
+                return torch.zeros((nd,) + a.shape[1:], device=a.device, dtype=torch.float32).index_add_(
+                    0, pid, a[pix].float() * wd.float().view((-1,) + (1,) * (a.dim() - 1)))
+
+            out.update(q_gain=gain.view(m, K), q_detail=pick.view(m, K), d_anchor=dkey // K, d_cell=dkey % K, d_count=dn,
+                       d_share=(wf_sum[keepf] / wsum[dkey // K]).float(), d_uvn=duvn.float(), d_sd=(d2 - duvn * duvn).clamp_min(0.0).sqrt().float(),
+                       d_feat=dmean(feat), d_J=dmean(J), d_raw=dmean(raw), detail=S)
+            if times is not None:
+                with torch.no_grad():
+                    out["d_t"] = dmean(times.float()[:, None])[:, 0]
     return out
 
 
@@ -214,12 +262,12 @@ class AnchorHead(nn.Module):
         f, sd = self.context(a)
         return self.decode(a, f, sd)
 
-    def decode(self, a, f, sd):
+    def decode(self, a, f, sd, scale_cap=0.0):
         o = self.out(f)
         off = 0.5 * torch.tanh(o[:, 0:3]) * o.new_tensor([0.0, 0.0, 1.0])
         e = a["edge"][:, None]
         base = torch.stack([sd[:, 0].clamp(0.15, 0.6), sd[:, 1].clamp(0.15, 0.6), sd[:, 2].clamp(0.02, 0.3)], dim=-1)
-        rel = base * torch.exp(o[:, 3:6])
+        rel = base * torch.exp(_cap(o[:, 3:6], scale_cap))
         means = a["centroid"] + e * torch.einsum("mij,mj->mi", a["frame"], off)
         quat = quat_mul(rotmat_to_quat(a["frame"]), F.normalize(o[:, 6:10], dim=-1))
         colour = Splatt3RHead.colour(o[:, 10:13], a["J"])
@@ -236,26 +284,59 @@ N_X = 7
 PRUNE_OPACITY = 1.0 / 255.0
 
 
-def activate_x(raw, gate_init=0.0):
+def _bound(x, lo, hi, soft):
+    """x kept in [lo, hi] (lo < 0 < hi): the clamp, or with soft hi tanh(x / hi) above 0 and lo tanh(x / lo) below, the
+    identity near 0 with a gradient above 0 everywhere."""
+    if not soft:
+        return x.clamp(lo, hi)
+    return torch.where(x >= 0, hi * torch.tanh(x / hi), lo * torch.tanh(x / lo))
+
+
+def _cap(x, hi):
+    return torch.where(x > 0, hi * torch.tanh(x / hi), x) if hi > 0 else x
+
+
+def activate_x(raw, gate_init=0.0, soft=False):
     """Beta shape, dynamic gate, relative temporal width, temporal shape and velocity of raw (..., 7), the
     activations of the 21 channel head of model/gaussian_head.py (the same constants), with the velocity in edges per
     second in the anchor frame (10 footprints per second per unit there, an edge of 8 footprints here). A zero raw
     gives beta 4 and a static slot (gate 0). With gate_init > 0 the gate is sigmoid(raw + logit(gate_init)) instead:
     gate_init for a zero raw, always inside (0, 1), so its gradient does not stop below 0 as that of the 21 channel
-    form does behind the clamp of slot_at_time."""
+    form does behind the clamp of slot_at_time. With soft the bounds of beta, temporal width, temporal shape and
+    velocity are those of _bound, so no output loses its gradient at a bound."""
     if gate_init > 0:
         gate = torch.sigmoid(raw[..., 1] + math.log(gate_init / (1.0 - gate_init)))
     else:
         u = torch.expm1(raw[..., 1].clamp(-20.0, 20.0))
         gate = GATE_P0 * u / (1.0 + GATE_P0 * u)
-    return dict(beta=BETA_BASE * torch.exp(raw[..., 0].clamp(-BETA_RANGE, BETA_RANGE)), gate=gate,
-                tw_rel=TW_BASE * torch.exp(raw[..., 2].clamp(TW_MIN, TW_MAX)), tb=raw[..., 3].clamp(-TB_RANGE, TB_RANGE),
-                vel_e=VEL_UNIT_EDGE * raw[..., 4:7].clamp(-VEL_RANGE, VEL_RANGE))
+    return dict(beta=BETA_BASE * torch.exp(_bound(raw[..., 0], -BETA_RANGE, BETA_RANGE, soft)), gate=gate,
+                tw_rel=TW_BASE * torch.exp(_bound(raw[..., 2], TW_MIN, TW_MAX, soft)), tb=_bound(raw[..., 3], -TB_RANGE, TB_RANGE, soft),
+                vel_e=VEL_UNIT_EDGE * _bound(raw[..., 4:7], -VEL_RANGE, VEL_RANGE, soft))
 
 
 def _floor(x, lo):
     """Smooth lower bound sqrt(lo^2 + x^2) >= lo."""
     return torch.sqrt(x * x + lo * lo)
+
+
+def band_limit(scales, interval, beta=None):
+    """3D band limit of primitives sampled at `interval` (N,), the distance between neighbouring samples in the
+    units of scales (N, 3): sqrt(scales^2 + interval^2) in every axis, an isotropic 3D Gaussian of that sigma convolved
+    with the primitive (the 3D smoothing filter of Mip-Splatting, arXiv 2311.16493). Opacity is not rescaled: the
+    filter stands for the uncompensated screen dilation of the rasteriser moved into 3D (an interval of sqrt(0.3)
+    footprints is 0.3 px^2 at the source distance), and the 3D normalisation sqrt(det / det') would take the opacity
+    of a flat surface element to 0. With beta (N,), the Beta shape of the kernel, the added term is times beta / 4,
+    so the width of the Gaussian that the kernel matches (sigma sqrt(4 / beta), 4 being the fitted shape) keeps the
+    interval and a peaked shape cannot undo the overlap."""
+    add = interval.square() if beta is None else interval.square() * beta / BETA_BASE
+    return torch.sqrt(scales.square() + add[:, None])
+
+
+def slot_pitch(slot, cells, detail=0):
+    """Distance between neighbouring slots of the same kind in edges: 1 for a parent (slot 0), 1 / cells for a child,
+    1 / (cells detail) for a detail slot (slot cells^2 + 1)."""
+    one = torch.ones(slot.shape[0], device=slot.device)
+    return torch.where(slot == 0, one, torch.where(slot > cells * cells, one / (cells * max(1, int(detail))), one / cells))
 
 
 class ScaffoldHead(nn.Module):
@@ -284,14 +365,38 @@ class ScaffoldHead(nn.Module):
     time of the pixels of the slot (anchor or cell), for the time split of slot_at_time. gate_init > 0 starts every
     gate at gate_init with the sigmoid form of activate_x. beta_fixed > 0 (needs beta) gives every slot that constant
     beta instead of the output of the head, 4 being the shape fitted to the Gaussian (training/primitives4d.py
-    K_BETA4): the same rasteriser and head without a learned kernel shape."""
+    K_BETA4): the same rasteriser and head without a learned kernel shape.
+    Options that default to the head above. parent_slot False draws no parent Gaussian (the anchor only gives the
+    context of its children, as in Scaffold-GS). soft_clamp bounds the extra outputs with _bound. detail = S with
+    detail_frac (needs always_on) replaces the child of every cell that build_anchors marked (q_detail) by one slot
+    per occupied fine cell (slot index cells^2 + 1), decoded by its own MLP from the anchor context and the pooled
+    feature, colour, spread and position of the fine cell; its last layer starts at zero, so an untrained detail slot
+    is the fine cell itself (centroid, spread with the floor detail_floor edges, default child_floor / S, restored
+    colour, opacity sigmoid(opacity_bias)). transient = W seconds (needs four_d and gate_init > 0) keeps of the 4D
+    outputs only the gate, as the share of a slot that exists at its own time alone: no velocity, the window fixed
+    at W seconds, and slot_at_time draws one primitive with opacity o (1 - gate (1 - window(t - t_src))). parent_norm
+    puts a LayerNorm in front of the layer of the parent's extra outputs, which otherwise reads the raw context.
+    band = c > 0 applies band_limit to every slot with the interval c times its pitch (slot_pitch: the edge for a
+    parent, edge / cells for a child, edge / (cells S) for a detail slot), so neighbouring slots overlap at any anchor
+    edge and whatever Beta shape the head gives; the opacity is left as it is."""
 
     scaffold = True
 
     def __init__(self, feat_dim=FEAT_DIM, width=128, blocks=2, opacity_bias=2.0, child_use_bias=-2.0, parent_use_bias=3.0,
                  parent_floor=0.35, child_floor=0.18, cells=2, beta=False, four_d=False, scaffold=True, always_on=False,
-                 gate_init=0.0, beta_fixed=0.0):
+                 gate_init=0.0, beta_fixed=0.0, parent_slot=True, soft_clamp=False, detail=0, detail_frac=0.0, detail_floor=0.0,
+                 transient=0.0, parent_norm=False, band=0.0, pos_range=0.5, scale_cap=0.0, exist=0.0):
         super().__init__()
+        if float(exist) < 0.0 or (float(exist) > 0.0 and (not four_d or float(transient) > 0.0)):
+            raise ValueError("exist needs four_d and no transient")
+        if float(scale_cap) < 0.0:
+            raise ValueError(f"scale_cap {scale_cap} below 0")
+        if float(pos_range) <= 0.0:
+            raise ValueError(f"pos_range {pos_range} not above 0")
+        if int(detail) > 0 and not always_on:
+            raise ValueError("detail needs always_on")
+        if float(transient) > 0.0 and not (four_d and float(gate_init) > 0.0):
+            raise ValueError("transient needs four_d and gate_init > 0")
         if not 0.0 <= float(gate_init) < 1.0:
             raise ValueError(f"gate_init {gate_init} outside [0, 1)")
         if float(beta_fixed) < 0.0:
@@ -303,6 +408,13 @@ class ScaffoldHead(nn.Module):
                         parent_use_bias=parent_use_bias, parent_floor=parent_floor, child_floor=child_floor, cells=cells,
                         beta=bool(beta), four_d=bool(four_d), scaffold=True, always_on=bool(always_on), gate_init=float(gate_init),
                         beta_fixed=float(beta_fixed))
+        new = dict(parent_slot=bool(parent_slot), soft_clamp=bool(soft_clamp), detail=int(detail), detail_frac=float(detail_frac),
+                   detail_floor=float(detail_floor), transient=float(transient), parent_norm=bool(parent_norm), band=float(band),
+                   pos_range=float(pos_range), scale_cap=float(scale_cap), exist=float(exist))
+        self.cfg.update({k: v for k, v in new.items() if v != dict(parent_slot=True, soft_clamp=False, detail=0, detail_frac=0.0,
+                                                                  detail_floor=0.0, transient=0.0, parent_norm=False, band=0.0,
+                                                                  pos_range=0.5, scale_cap=0.0, exist=0.0)[k]})
+        self.opt = new
         self.cells = int(cells)
         self.extra = N_X if (beta or four_d) else 0
         cin = width + feat_dim + 3 + 3 + 3 + 1 + self.cells ** 2
@@ -310,6 +422,8 @@ class ScaffoldHead(nn.Module):
         self.child_out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, N_OUT + 1 + self.extra))
         self.parent_use = nn.Linear(width, 1)
         self.parent_x = nn.Linear(width, N_X) if self.extra else None
+        if self.extra and parent_norm:
+            self.parent_x = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, N_X))
         with torch.no_grad():
             last = self.child_out[-1]
             last.weight.mul_(0.01)
@@ -320,14 +434,26 @@ class ScaffoldHead(nn.Module):
             self.parent_use.weight.zero_()
             self.parent_use.bias.fill_(parent_use_bias)
             if self.parent_x is not None:
-                self.parent_x.weight.zero_()
-                self.parent_x.bias.zero_()
+                lin = self.parent_x[-1] if parent_norm else self.parent_x
+                lin.weight.zero_()
+                lin.bias.zero_()
+        if int(detail) > 0:
+            din = width + feat_dim + 3 + 3 + 3 + 1
+            self.detail_inp = nn.Sequential(nn.LayerNorm(din), nn.Linear(din, width), nn.GELU(), nn.Linear(width, width))
+            self.detail_out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, N_OUT + self.extra))
+            with torch.no_grad():
+                last = self.detail_out[-1]
+                last.weight.zero_()
+                last.bias.zero_()
+                last.bias[6] = 1.0
+                last.bias[13] = opacity_bias
         self.mode = "soft"
 
     def forward(self, a):
         P = self.parent
         f, sd = P.context(a)
-        po = P.decode(a, f, sd)
+        sr = self.opt["scale_cap"]
+        po = P.decode(a, f, sd, sr)
         e = a["edge"][:, None]
         rel = po["scales"] / e
         rel = torch.cat([_floor(rel[:, :2], self.cfg["parent_floor"]), rel[:, 2:]], dim=-1)
@@ -337,7 +463,7 @@ class ScaffoldHead(nn.Module):
         n_child = 0
         X = []
         if self.extra:
-            px = activate_x(self.parent_x(f), self.cfg["gate_init"])
+            px = activate_x(self.parent_x(f), self.cfg["gate_init"], self.opt["soft_clamp"])
             vel = e * torch.einsum("mij,mj->mi", a["frame"], px["vel_e"])
             t0 = a["t"] if "t" in a else torch.zeros_like(a["edge"])
             X.append(dict(beta=px["beta"], gate=px["gate"], tw_rel=px["tw_rel"], tb=px["tb"], vel=vel, t_src=t0.to(vel.dtype)))
@@ -350,14 +476,17 @@ class ScaffoldHead(nn.Module):
                             a["q_share"][..., None], onehot], dim=-1)
             oc = self.child_out(self.child_inp(xc))
             exists = (a["q_count"] > 0).reshape(-1)
-            delta = torch.cat([(0.5 / s) * torch.tanh(oc[..., 0:2]), 0.5 * torch.tanh(oc[..., 2:3])], dim=-1)
+            if self.opt["detail"] > 0 and "q_detail" in a:
+                exists = exists & ~a["q_detail"].reshape(-1)
+            pr = self.opt["pos_range"]
+            delta = torch.cat([(pr / s) * torch.tanh(oc[..., 0:2] * (0.5 / pr)), 0.5 * torch.tanh(oc[..., 2:3])], dim=-1)
             loc = a["q_uvn"] + delta
             ec = e[:, :, None]
             mc = a["centroid"][:, None] + ec * torch.einsum("mij,mqj->mqi", a["frame"], loc)
             lo, hi = 0.16 / s, 0.6 / s
             base = torch.stack([a["q_sd"][..., 0].clamp(lo, hi), a["q_sd"][..., 1].clamp(lo, hi),
                                 a["q_sd"][..., 2].clamp(0.02, 0.3)], dim=-1)
-            relc = base * torch.exp(oc[..., 3:6])
+            relc = base * torch.exp(_cap(oc[..., 3:6], sr))
             relc = torch.cat([_floor(relc[..., :2], self.cfg["child_floor"]), relc[..., 2:]], dim=-1)
             qc = quat_mul(rotmat_to_quat(a["frame"])[:, None].expand(m, K, 4).reshape(-1, 4),
                           F.normalize(oc[..., 6:10], dim=-1).reshape(-1, 4))
@@ -372,15 +501,45 @@ class ScaffoldHead(nn.Module):
             slot.append((torch.arange(K, device=f.device) + 1)[None].expand(m, K).reshape(-1)[exists])
             n_child = int(exists.sum())
             if self.extra:
-                cx = activate_x(oc[..., N_OUT + 1:N_OUT + 1 + N_X], self.cfg["gate_init"])
+                cx = activate_x(oc[..., N_OUT + 1:N_OUT + 1 + N_X], self.cfg["gate_init"], self.opt["soft_clamp"])
                 velc = ec * torch.einsum("mij,mqj->mqi", a["frame"], cx["vel_e"])
                 tq = a["q_t"] if "q_t" in a else torch.zeros_like(a["q_share"])
                 X.append(dict(beta=cx["beta"].reshape(-1)[exists], gate=cx["gate"].reshape(-1)[exists],
                               tw_rel=cx["tw_rel"].reshape(-1)[exists], tb=cx["tb"].reshape(-1)[exists],
                               vel=velc.reshape(-1, 3)[exists], t_src=tq.reshape(-1)[exists].to(velc.dtype)))
+        n_detail = 0
+        edges = [a["edge"]] + ([a["edge"][:, None].expand(-1, self.cells ** 2).reshape(-1)[exists]] if n_child else [])
+        if self.opt["detail"] > 0 and "d_anchor" in a and a["d_anchor"].numel() > 0:
+            da = a["d_anchor"]
+            s2 = self.cells * self.opt["detail"]
+            od = self.detail_out(self.detail_inp(torch.cat([f[da], a["d_feat"].to(f.dtype), a["d_J"], a["d_sd"], a["d_uvn"],
+                                                            a["d_share"][:, None]], dim=-1)))
+            ed = a["edge"][da][:, None]
+            prd = self.opt["pos_range"]
+            locd = a["d_uvn"] + torch.cat([(prd / s2) * torch.tanh(od[:, 0:2] * (0.5 / prd)), 0.5 * torch.tanh(od[:, 2:3])], dim=-1)
+            lo, hi = 0.16 / s2, 0.6 / s2
+            reld = torch.stack([a["d_sd"][:, 0].clamp(lo, hi), a["d_sd"][:, 1].clamp(lo, hi), a["d_sd"][:, 2].clamp(0.02, 0.3)],
+                               dim=-1) * torch.exp(_cap(od[:, 3:6], sr))
+            dfl = self.opt["detail_floor"] if self.opt["detail_floor"] > 0 else self.cfg["child_floor"] / self.opt["detail"]
+            reld = torch.cat([_floor(reld[:, :2], dfl), reld[:, 2:]], dim=-1)
+            means.append(a["centroid"][da] + ed * torch.einsum("dij,dj->di", a["frame"][da], locd))
+            scales.append(ed * reld)
+            quat.append(quat_mul(rotmat_to_quat(a["frame"])[da], F.normalize(od[:, 6:10], dim=-1)))
+            opac.append(torch.sigmoid(od[:, 13]))
+            Js.append(Splatt3RHead.colour(od[:, 10:13], a["d_J"]))
+            raws.append(a["d_raw"])
+            use.append(torch.ones_like(od[:, 13]))
+            slot.append(torch.full((da.numel(),), self.cells ** 2 + 1, dtype=torch.long, device=f.device))
+            edges.append(a["edge"][da])
+            n_detail = int(da.numel())
+            if self.extra:
+                dx = activate_x(od[:, N_OUT:N_OUT + N_X], self.cfg["gate_init"], self.opt["soft_clamp"])
+                td = a["d_t"] if "d_t" in a else torch.zeros_like(a["d_share"])
+                X.append(dict(beta=dx["beta"], gate=dx["gate"], tw_rel=dx["tw_rel"], tb=dx["tb"],
+                              vel=ed * torch.einsum("dij,dj->di", a["frame"][da], dx["vel_e"]), t_src=td.to(ed.dtype)))
         means, scales, quat, opac = torch.cat(means), torch.cat(scales), torch.cat(quat), torch.cat(opac)
         Js, raws, use, slot = torch.cat(Js), torch.cat(raws), torch.cat(use), torch.cat(slot)
-        edge_all = torch.cat([a["edge"], a["edge"][:, None].expand(-1, self.cells ** 2).reshape(-1)[exists]]) if n_child else a["edge"]
+        edge_all = torch.cat(edges)
         on = self.cfg.get("always_on", False)
         if on:
             opacity = opac
@@ -397,9 +556,13 @@ class ScaffoldHead(nn.Module):
         else:
             opacity = opac * use
             sel = None
+        if not self.opt["parent_slot"]:
+            sel = (slot > 0) if sel is None else sel & (slot > 0)
         kept = sel if sel is not None else use.detach() > 0.5
         stats = dict(n_anchor=int(f.shape[0]), n_child=n_child, parent_kept=int(kept[slot == 0].sum()),
                      child_kept=int(kept[slot > 0].sum()))
+        if self.opt["detail"] > 0:
+            stats.update(n_detail=n_detail, detail_kept=int(kept[slot > self.cells ** 2].sum()))
         if not on:
             stats["use_mean"] = use.mean()
         xs = {k: torch.cat([x[k] for x in X]) for k in X[0]} if X else {}
@@ -414,6 +577,14 @@ class ScaffoldHead(nn.Module):
             xs.pop("beta", None)
         if not self.cfg["four_d"]:
             xs = {k: v for k, v in xs.items() if k == "beta"}
+        elif self.opt["transient"] > 0.0:
+            xs.update(vel=torch.zeros_like(xs["vel"]), tb=torch.zeros_like(xs["tb"]), tw_rel=torch.full_like(xs["tw_rel"], self.opt["transient"]),
+                      transient=self.opt["transient"])
+        elif self.opt["exist"] > 0.0:
+            xs.update(vel=torch.zeros_like(xs["vel"]), tb=torch.zeros_like(xs["tb"]), gate=torch.ones_like(xs["gate"]),
+                      tw_rel=xs["tw_rel"] * (self.opt["exist"] / TW_BASE), exist=self.opt["exist"])
+        if self.opt["band"] > 0.0:
+            scales = band_limit(scales, self.opt["band"] * edge_all * slot_pitch(slot, self.cells, self.opt["detail"]), xs.get("beta"))
         extra = dict(slot=slot) if on else dict(use=use, slot=slot)
         return dict(means=means, scales=scales, quat=quat, opacity=opacity, J=Js, raw=raws, offset=po["offset"],
                     scale_edges=(scales.detach() / edge_all[:, None]).max(dim=-1).values, **extra, **stats, **xs)
@@ -424,12 +595,26 @@ def slot_at_time(g, t, min_opacity=1.0 / 255.0):
     o (1 - gate) and, where o gate > min_opacity, a dynamic copy with opacity o gate window(t - t_src) moved by
     vel (t - t_src), window the temporal opacity of Universal Beta Splatting (training/primitives4d.py). g holds
     means, opacity, scales, quat, J and beta, gate, tw (seconds), tb, vel, t_src per slot; without gate or with t None
-    g is returned as it is. The copies keep the gradient of every input."""
+    g is returned as it is. The copies keep the gradient of every input. With g['transient'] = W > 0 (seconds) there is
+    no copy and no motion: every slot keeps its place with opacity o (1 - gate (1 - window)), window of width W and
+    temporal shape 0, so a slot shows in full at its own time and its share 1 - gate at any other time."""
     if t is None or "gate" not in g:
         return g
+    if float(g.get("exist", 0.0) or 0.0) > 0.0:
+        dt = torch.as_tensor(t, dtype=g["t_src"].dtype, device=g["t_src"].device) - g["t_src"]
+        out = dict(g)
+        out["opacity"] = g["opacity"] * torch.exp(-0.5 * (dt / g["tw"].clamp_min(1e-6)).square())
+        out["n_dyn"] = 0
+        return out
     from training.primitives4d import temporal_window
     gate = g["gate"].clamp(0.0, 1.0)
     o = g["opacity"]
+    if float(g.get("transient", 0.0) or 0.0) > 0.0:
+        dt = torch.as_tensor(t, dtype=g["t_src"].dtype, device=g["t_src"].device) - g["t_src"]
+        out = dict(g)
+        out["opacity"] = o * (1.0 - gate * (1.0 - temporal_window(dt, float(g["transient"]), 0.0)))
+        out["n_dyn"] = int(((o * gate).detach() > min_opacity).sum())
+        return out
     dyn = (o * gate).detach() > min_opacity
     dt = (torch.as_tensor(t, dtype=g["t_src"].dtype, device=g["t_src"].device) - g["t_src"])[dyn]
     out = dict(g)

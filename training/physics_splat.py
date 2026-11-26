@@ -77,11 +77,53 @@ def medium(phys, feat, z, img_raw=None, beta_D_scale=None):
     """feat (B, N, 1024) encoder tokens, z (B, H, W) depth. Returns beta_D, beta_B (B, 3, H, W), B_inf (B, 3) and
     the per view parameters params_D, params_B (B, 4, 3), with a spatial head also B_inf_map (B, 3, H, W).
     beta_D_scale (3,) is the Stage 1 per channel scale."""
+    return medium_live(phys, feat, z, img_raw, beta_D_scale)
+
+
+def medium_live(phys, feat, z, img_raw=None, beta_D_scale=None):
     out = phys(feat, z=z, img_raw=img_raw)
     if beta_D_scale is not None:
         sc = torch.as_tensor(beta_D_scale, dtype=out["beta_D"].dtype, device=out["beta_D"].device).reshape(1, 3, 1, 1)
         out = dict(out, beta_D=out["beta_D"] * sc, beta_D_scale=sc.reshape(3))
     return out
+
+
+def detach_medium(med):
+    return {k: (v.detach() if torch.is_tensor(v) else v) for k, v in med.items()}
+
+
+def limit_medium(med, mode, weight=1.0):
+    out = dict(med)
+    if mode == "binf":
+        for k in ("beta_D", "beta_B", "params_D", "params_B"):
+            if k in out:
+                out[k] = out[k].detach()
+    if weight != 1.0:
+        for k in ("beta_D", "beta_B", "params_D", "params_B", "B_inf", "B_inf_map"):
+            if k in out and torch.is_tensor(out[k]) and out[k].requires_grad:
+                out[k] = out[k].detach() + float(weight) * (out[k] - out[k].detach())
+    return out
+
+
+def trainable_medium(phys, mode):
+    mlp = phys.physics.mlp
+    if mode == "all":
+        ps = list(mlp.parameters())
+        for p in ps:
+            p.requires_grad_(True)
+        return ps
+    if mode != "binf":
+        raise ValueError(f"medium training mode {mode}: off, binf or all")
+    last = mlp[-1]
+    if last.out_features < 18:
+        raise ValueError(f"the physics head has {last.out_features} outputs, B_inf rows need the unified head (18 or 33)")
+    keep = torch.zeros(last.out_features, dtype=torch.bool)
+    keep[15:] = True
+    ps = [last.weight, last.bias]
+    for p in ps:
+        p.requires_grad_(True)
+        p.register_hook(lambda g_, k=keep: g_ * k.to(g_.device).reshape((-1,) + (1,) * (g_.dim() - 1)).to(g_.dtype))
+    return ps
 
 
 def beta_at(phys, med, z, view=None):
@@ -170,3 +212,33 @@ def underwater_colours(phys, J, z, med1, uv=None):
     bD, bB = beta_at(phys, med1, z.clamp_min(1e-4))
     zz = z.clamp_min(1e-4)[None]
     return (J.t() * torch.exp(-bD * zz) + binf_at(med1, uv).t() * (1.0 - torch.exp(-bB * zz))).t()
+
+
+def veil_terms(phys, med1, alpha, j_pre, z_surf, z_ref):
+    n, h, w = alpha.shape
+    a = alpha[:, None].clamp(0.0, 1.0)
+
+    def tw(z):
+        ok = torch.isfinite(z) & (z > 1e-6)
+        zz = torch.where(ok, z, torch.ones_like(z)).reshape(-1)
+        bD, bB = beta_at(phys, med1, zz)
+        td = torch.exp(-bD * zz[None]).reshape(3, n, h, w).permute(1, 0, 2, 3)
+        wv = (1.0 - torch.exp(-bB * zz[None])).reshape(3, n, h, w).permute(1, 0, 2, 3)
+        m = ok[:, None]
+        return torch.where(m, td, torch.ones_like(td)), torch.where(m, wv, torch.zeros_like(wv))
+
+    td_s, w_s = tw(z_surf)
+    td_r, w_r = tw(z_ref)
+    return dict(known=j_pre * td_s, gain=a * w_s + (1.0 - a) * w_r, slack=(1.0 - a) * td_r, veil_surface=w_s, veil_reference=w_r)
+
+
+def veil_loss(med, raw, z):
+    ok = (torch.isfinite(z) & (z > 1e-6))[:, None]
+    zz = torch.where(ok, z[:, None], torch.ones_like(z[:, None]))
+    td = torch.exp(-med["beta_D"].detach() * zz)
+    wv = 1.0 - torch.exp(-med["beta_B"].detach() * zz)
+    b = med["B_inf_map"] if "B_inf_map" in med else med["B_inf"][:, :, None, None]
+    lo = b * wv
+    r = torch.relu(lo - raw) + torch.relu(raw - lo - td)
+    m = ok.to(raw.dtype)
+    return (r.square() * m).sum() / (3.0 * m.sum().clamp_min(1.0))

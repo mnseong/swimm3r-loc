@@ -36,11 +36,12 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mast3r.utils.path_to_dust3r  # noqa: E402,F401
 import eval_gaussian_map as E  # noqa: E402
-from model.anchor_head import AnchorHead, ScaffoldHead, build_anchors, describe, pixel_normals, slot_at_time  # noqa: E402
+from model.anchor_head import AnchorHead, ScaffoldHead, band_limit, build_anchors, describe, pixel_normals, slot_at_time  # noqa: E402
 from model.splatt3r_head import Splatt3RHead, load_splatt3r  # noqa: E402
 from training.gaussian_branch import NEAR_UNITS, quat_mul, render_view, render_view_beta, rotmat_to_quat, voxel_fuse  # noqa: E402
 from training.primitives4d import EPS2D_BETA4, K_BETA4, frame_gaps  # noqa: E402
 from training.physics_splat import background, invert, load_physics, medium, underwater_colours  # noqa: E402
+from training import medium_raster as MR  # noqa: E402
 
 
 def frame_passes(net, head, imgs, chunk=4, features=False):
@@ -130,7 +131,60 @@ def main():
                          "built from that frame alone, both with the frame's own medium, PSNR on all pixels, on the pixels the "
                          "map covers (alpha > 0.5) and on the rest, the share of the squared error in uncovered pixels, the fused "
                          "map with the medium of the two nearest other frames, and the water alone (B_inf, no Gaussians)")
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--no_parent", action="store_true",
+                    help="probe on a trained scaffold head: the parent Gaussians are left out of the map")
+    ap.add_argument("--detail", type=float, nargs=2, default=None, metavar=("S", "FRAC"),
+                    help="probe on a scaffold head trained without the detail layer: the FRAC of the cells with the most colour "
+                         "detail drawn as S x S untrained fine slots (the fine cells themselves) in place of their child")
+    ap.add_argument("--beta_fixed", type=float, default=None,
+                    help="probe on a trained Beta scaffold head: every slot drawn with this Beta shape")
+    ap.add_argument("--band", type=float, default=None, metavar="C",
+                    help="probe: 3D band limit of the map (model/anchor_head.py band_limit) with the interval C slot pitches of a "
+                         "scaffold head or C pixel footprints of the per pixel head, opacity unchanged")
+    ap.add_argument("--medium_raster", choices=("s2", "preshade"), default="s2",
+                    help="underwater render of a Beta kernel map: s2 gives the rasteriser the medium as three per pixel maps (veiling "
+                         "light, beta_B, beta_D at the depth of the pixel) and it accumulates the water between the primitives along "
+                         "the ray with its attenuation aware alpha, as the per scene renderer of Stage 2 does; preshade shades every "
+                         "primitive before the rasteriser (the render up to v9c)")
+    ap.add_argument("--time_bucket", type=int, default=0, metavar="K",
+                    help="probe of a time local map: next to the map of all frames, one map per window of K consecutive map frames "
+                         "(windows start every K // 2 frames), and every view is drawn from the window whose mean time is nearest to "
+                         "the time of the view, so a primitive only exists on its stretch of the trajectory (0 off)")
+    ap.add_argument("--exist_scale", type=float, default=1.0,
+                    help="maps of a head with existence intervals: the width of every slot times this factor (0 draws every slot at every "
+                         "time, the map without time)")
+    ap.add_argument("--grad_deconf", action="store_true",
+                    help="--medium_raster s2: the pose steps use the gradient separation of the final Stage 2 runs (the error the medium "
+                         "explains is kept out of the gradient of the projected centres)")
+    ap.add_argument("--far_layer", action="store_true",
+                    help="anchor head maps: the pixels the confidence filter leaves out also get primitives, at the depth of the backbone, "
+                         "as a second map drawn behind the map (and behind the time window). No ray is empty then, and the colour of a "
+                         "far region comes from the attenuation and the backscatter at its depth as everywhere else; nothing is taken "
+                         "as open water. Old render path only")
+    ap.add_argument("--binf_veil", action="store_true",
+                    help="medium field: B_inf is fitted to the map frames themselves through the image formation at the depth of every "
+                         "pixel, not to the B_inf of the physics head alone. Where the map has a primitive the frame equals its water "
+                         "free colour times exp(-beta_D z) plus B_inf (1 - exp(-beta_B z)) at the rendered depth; where it has none "
+                         "the surface colour is unknown between 0 and 1 and the depth is the one of the backbone, so the frame lies "
+                         "between B_inf (1 - exp(-beta_B z)) and that plus exp(-beta_D z). A far pixel fixes B_inf, a near one says "
+                         "nothing, no pixel is declared water. The B_inf of the head stays as a prior of weight --binf_prior")
+    ap.add_argument("--binf_prior", type=float, default=0.06,
+                    help="--binf_veil: weight of the squared difference to the B_inf of the head against the squared excess of the frame")
+    ap.add_argument("--time_fill", action="store_true",
+                    help="with --time_bucket and --medium_raster preshade: the primitives of the window are drawn in front of the map of "
+                         "all frames, which shows wherever the window has none, so the window decides what a view shows where it has "
+                         "seen the surface and nothing is left uncovered")
+    ap.add_argument("--scale_cap", type=float, default=None, metavar="R",
+                    help="probe: soft bound R on the positive log size output of every slot of a scaffold head (ScaffoldHead scale_cap)")
+    ap.add_argument("--overlap", type=int, default=0,
+                    help="overlap of the map (key overlap of scores.json, tools/map_overlap.py): the in plane sigma over the distance "
+                         "to the nearest neighbours, and on N map frames the share of the confident pixels with alpha > 0.5 at 1, 2 "
+                         "and 4 times the focal length")
+    ap.add_argument("--gate_test", type=int, default=0,
+                    help="4D scaffold maps: whether the gate encodes content (key gate_test of scores.json, tools/gate_metric.py): "
+                         "variance share of the slot kind, rank agreement inside every kind with the see through share and the "
+                         "colour difference over the map frames, and on N held out frames the PSNR with the gate of the map, with "
+                         "the gate shuffled inside every kind and with gate 0")
     ap.add_argument("--bench", action="store_true",
                     help="benchmark of the localization in place of the standard evaluation of the held out frames "
                          "(tools/bench_loc.py): tracking FPS at several numbers of pose steps, rendering FPS and the memory "
@@ -140,6 +194,7 @@ def main():
     ap.add_argument("--bench_render_reps", type=int, default=5)
     ap.add_argument("--bench_warmup", type=int, default=2)
     ap.add_argument("--bench_mapping_seconds", type=float, default=None)
+    ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     dev = torch.device(args.device)
@@ -162,13 +217,29 @@ def main():
         if "anchor" in ck and args.anchor_px is not None and args.anchor_px <= 0:
             ap.error("this head was trained with the anchor head, its last 14 channel convolution never trained: give --anchor_px > 0")
         if "anchor" in ck:
-            cfg = ck["anchor_cfg"]
+            cfg = dict(ck["anchor_cfg"])
+            probe = {}
             if cfg.get("scaffold"):
+                if args.no_parent:
+                    probe["parent_slot"] = False
+                if args.detail:
+                    probe.update(detail=int(args.detail[0]), detail_frac=float(args.detail[1]))
+                if args.beta_fixed is not None:
+                    probe["beta_fixed"] = float(args.beta_fixed)
+                if args.band is not None:
+                    probe["band"] = float(args.band)
+                if args.scale_cap is not None:
+                    probe["scale_cap"] = float(args.scale_cap)
+                cfg.update(probe)
                 anchor = ScaffoldHead(**cfg)
                 anchor.mode = "infer_soft" if args.scaffold_mode == "soft" else "infer"
             else:
                 anchor = AnchorHead(feat_dim=cfg["feat_dim"], width=cfg["width"], blocks=cfg["blocks"], opacity_bias=cfg["opacity_bias"])
-            anchor.load_state_dict(ck["anchor"])
+            miss = anchor.load_state_dict(ck["anchor"], strict=not probe)
+            if probe:
+                if [k for k in miss.missing_keys if not k.startswith("detail_")] or miss.unexpected_keys:
+                    ap.error(f"the head does not fit the probe {probe}: missing {miss.missing_keys[:6]}, unexpected {miss.unexpected_keys[:6]}")
+                print(f"[probe] {probe}" + (f", {len(miss.missing_keys)} detail tensors untrained" if miss.missing_keys else ""), flush=True)
             anchor = anchor.to(dev).eval()
             if args.anchor_px is None:
                 args.anchor_px = 8.0
@@ -212,17 +283,21 @@ def main():
             parts["conf"].append(conf[i][good])
             parts["zsrc"].append(z[good])
             parts["opacity"].append(act["opacity"][i][good])
-            parts["scales"].append((act["scales"][i] * ratio[i])[good])
+            sc_i = (act["scales"][i] * ratio[i])[good]
+            parts["scales"].append(band_limit(sc_i, float(args.band) * (z / f_)[good]) if (args.band and anchor is None) else sc_i)
             parts["quat"].append(quat_mul(rotmat_to_quat(c2w[i, :3, :3])[None, None].expand(h, w, 4), act["quat"][i])[good])
             parts["J"].append(Splatt3RHead.colour(act["sh_dc"][i], J[i].permute(1, 2, 0))[good])
             parts["raw"].append(imgs[i].permute(1, 2, 0)[good])
             parts["vid"].append(torch.full((int(good.sum()),), i, device=dev, dtype=torch.long))
         pr = {k: torch.cat(vv) for k, vv in parts.items()}
         n_in = pr["xyz"].shape[0]
+        tmaps = []
+        g_far = None
         zs = depth[depth > 1e-4]
         unit = NEAR_UNITS / torch.quantile(zs[:: max(1, zs.numel() // 200000)], 0.01).clamp_min(1e-4)
         if anchor is not None:
             pa = {k: [] for k in ("xyz", "fp", "conf", "cam", "camx", "nrm", "vid", "feat", "J", "raw", "t")}
+            pf = {k: [] for k in pa}
             tf = torch.tensor([E.fnum(x) / args.fps for x in names], device=dev, dtype=torch.float32)
             for i in range(n):
                 f_, cx, cy = intr[i, 0, 0], intr[i, 0, 2] + 0.5, intr[i, 1, 2] + 0.5
@@ -242,6 +317,13 @@ def main():
                 pa["J"].append(J[i].permute(1, 2, 0)[good])
                 pa["raw"].append(imgs[i].permute(1, 2, 0)[good])
                 pa["t"].append(tf[i].expand(k))
+                if args.far_layer:
+                    far = torch.isfinite(xyz0).all(-1) & (z > 1e-4) & ~good
+                    kf = int(far.sum())
+                    for k_, v_ in dict(xyz=xyz0[far], fp=(z / f_)[far], conf=conf[i][far], cam=c2w[i, :3, 3].expand(kf, 3), camx=c2w[i, :3, 0].expand(kf, 3),
+                                       nrm=nrm[far], vid=torch.full((kf,), i, device=dev, dtype=torch.long), feat=featpx[i][far],
+                                       J=J[i].permute(1, 2, 0)[far], raw=imgs[i].permute(1, 2, 0)[far], t=tf[i].expand(kf)).items():
+                        pf[k_].append(v_)
             del featpx
             pa_single = {i: {k: pa[k][i] for k in pa} for i in diag_idx}
             pa = {k: torch.cat(vv) for k, vv in pa.items()}
@@ -251,7 +333,9 @@ def main():
                 a_ = build_anchors(p["xyz"], p["fp"], p["conf"], p["cam"], p["camx"], p["nrm"], p["vid"], p["feat"], p["J"],
                                    p["raw"], args.anchor_px, quadrants=bool(getattr(anchor, "scaffold", False)),
                                    cells=int(getattr(anchor, "cells", 2)),
-                                   times=p["t"] if getattr(anchor, "cfg", {}).get("four_d") else None)
+                                   times=p["t"] if getattr(anchor, "cfg", {}).get("four_d") else None,
+                                   detail=int(getattr(anchor, "cfg", {}).get("detail", 0)),
+                                   detail_frac=float(getattr(anchor, "cfg", {}).get("detail_frac", 0.0)))
                 o_ = anchor(a_)
                 gm = dict(xyz=o_["means"], means=o_["means"] * unit, scales=o_["scales"] * unit, quat=o_["quat"], opacity=o_["opacity"],
                           J=o_["J"], raw=o_["raw"], unit=unit, n_in=int(p["xyz"].shape[0]), n_out=o_["means"].shape[0])
@@ -259,14 +343,46 @@ def main():
                     gm["beta"] = o_["beta"]
                 if "gate" in o_:
                     gm.update(gate=o_["gate"], tw=o_["tw_rel"] * gap, tb=o_["tb"], vel=o_["vel"], t_src=o_["t_src"])
+                if "transient" in o_:
+                    gm["transient"] = o_["transient"]
+                if "exist" in o_:
+                    gm["exist"] = o_["exist"]
+                if "slot" in o_:
+                    gm["slot"] = o_["slot"]
                 return a_, o_, gm
 
             def single_map(i):
                 return anchor_map(pa_single[i])[2] if pa_single[i]["xyz"].shape[0] >= 16 else None
 
             anc, ga, g = anchor_map(pa)
+            if args.far_layer:
+                pf = {k: torch.cat(vv) for k, vv in pf.items()}
+                if pf["xyz"].shape[0] >= 1000:
+                    g_far = anchor_map(pf)[2]
+                    zc_, zf_ = pa["fp"].median(), pf["fp"].median()
+                    print(f"[far] {g_far['n_out'] / 1e6:.3f}M Gaussians from the {pf['xyz'].shape[0] / 1e6:.2f}M pixels the confidence filter leaves out "
+                          f"({pf['xyz'].shape[0] / max(1, pf['xyz'].shape[0] + n_in):.3f} of the pixels with a depth), median footprint "
+                          f"{float(zf_ / zc_.clamp_min(1e-9)):.2f} times the one of the map, opacity mean {float(g_far['opacity'].mean()):.3f}; "
+                          f"drawn behind the map", flush=True)
+            del pf
+            if args.time_bucket > 0:
+                order = torch.argsort(tf).tolist()
+                kb, sb = int(args.time_bucket), max(1, int(args.time_bucket) // 2)
+                for s0 in range(0, max(1, n - kb + sb), sb):
+                    idx = order[s0:s0 + kb]
+                    sel_ = torch.isin(pa["vid"], torch.tensor(idx, device=dev))
+                    if not idx or int(sel_.sum()) < 1000:
+                        continue
+                    tmaps.append((float(tf[idx].mean()), anchor_map({k: v[sel_] for k, v in pa.items()})[2]))
+                print(f"[time] {len(tmaps)} windows of {kb} map frames every {sb}: {sum(m_['n_out'] for _, m_ in tmaps) / 1e6:.2f}M Gaussians in all, "
+                      f"{np.mean([m_['n_out'] for _, m_ in tmaps]) / 1e6:.3f}M per window (the map of all frames has {g['n_out'] / 1e6:.2f}M), a view "
+                      f"is drawn from the window nearest in time", flush=True)
             del pa["feat"]
-            if "gate" in ga:
+            if "exist" in ga:
+                wq_ = torch.quantile(ga["tw_rel"].float()[:: max(1, ga["tw_rel"].numel() // 200000)], torch.tensor([0.05, 0.5, 0.95], device=dev))
+                print(f"[4d] existence intervals: width p05/p50/p95 {float(wq_[0]):.2f}/{float(wq_[1]):.2f}/{float(wq_[2]):.2f} frame gaps "
+                      f"(gap {gap:.3f} s), drawn with the widths times {args.exist_scale:g}", flush=True)
+            elif "gate" in ga:
                 dyn = (ga["opacity"] * ga["gate"].clamp(0, 1)) > 1.0 / 255.0
                 print(f"[4d] gate mean {float(ga['gate'].mean()):.4f}, {int(dyn.sum())} slots with a dynamic copy "
                       f"({float(dyn.float().mean()):.4f}), velocity median {float(ga['vel'].norm(dim=-1).median()):.5f} units per s, "
@@ -286,7 +402,9 @@ def main():
                 how = "always on" if anchor.cfg.get("always_on") else f"mode {anchor.mode}"
                 print(f"[scaffold] {how}, {ga['n_anchor']} anchors: parents kept {ga['parent_kept'] / na:.2f}, children kept "
                       f"{ga['child_kept'] / na:.2f} of {ga['n_child'] / na:.2f} per anchor, {g['n_out'] / n_in:.4f} Gaussians per pixel, "
-                      f"opacity mean {float(ga['opacity'].mean()):.3f}", flush=True)
+                      f"opacity mean {float(ga['opacity'].mean()):.3f}"
+                      + (f", detail slots {ga['detail_kept'] / na:.2f} per anchor ({ga['detail_kept'] / max(1, g['n_out']):.2f} of the slots)"
+                         if "detail_kept" in ga else ""), flush=True)
         else:
             def pixel_map(q):
                 xyz_, m_, p_ = voxel_fuse(q["xyz"], q["conf"], q["fp"], dict(opacity=q["opacity"], J=q["J"], raw=q["raw"], zsrc=q["zsrc"]),
@@ -328,15 +446,58 @@ def main():
     field, views, medium_info = None, None, None
     if "field" in want or "views" in want:
         try:
-            from model.medium_field import ViewMedium, fit_medium_field, held_out_check
+            from model.medium_field import ViewMedium, binf_error, fit_medium_field, held_out_check
             tf = time.time()
             ho = held_out_check(med, c2w, intr, h, w, fnums, iters=args.medium_iters)
+            obs_w, veil_info = None, None
+            if "field" in want and args.binf_veil:
+                from training.physics_splat import veil_terms
+                al_, jp_, zs_ = [], [], []
+                with torch.no_grad():
+                    for i in range(n):
+                        cu_ = c2w[i].clone()
+                        cu_[:3, 3] = c2w[i, :3, 3] * unit
+                        fi_, ci_ = float(intr[i, 0, 0]), (float(intr[i, 0, 2]) + 0.5, float(intr[i, 1, 2]) + 0.5)
+                        one_ = lambda gm_: (render_view_beta(gm_["means"], gm_["opacity"], gm_["scales"], gm_["quat"], gm_["J"], cu_, fi_, h, w,
+                                                             torch.zeros(3, device=dev), pp=ci_, betas=gm_["beta"], scale_factor=K_BETA4, eps2d=EPS2D_BETA4)
+                                            if "beta" in gm_ else
+                                            render_view(gm_["means"], gm_["opacity"], gm_["scales"], gm_["quat"], gm_["J"], cu_, fi_, h, w,
+                                                        torch.zeros(3, device=dev), pp=ci_))
+                        ji_, di_, a_ = one_(g)
+                        if g_far is not None:
+                            jf_, df_, af_ = one_(g_far)
+                            ji_, di_, a_ = ji_ + (1.0 - a_) * jf_, di_ + (1.0 - a_) * df_, a_ + (1.0 - a_) * af_
+                        al_.append(a_.reshape(h, w))
+                        jp_.append(ji_.reshape(3, h, w))
+                        zs_.append(MR.expected_depth(di_, a_, unit))
+                    al_ = torch.stack(al_)
+                    m_all = med_of(list(range(n)))
+                    obs_w = dict(veil_terms(phys, m_all, al_, torch.stack(jp_), torch.stack(zs_), depth.float()), img=imgs.float())
+                    em_ = al_ < 0.5
+                    vr_, vs_ = obs_w["veil_reference"].mean(1), obs_w["veil_surface"].mean(1)
+                    zr_ok = torch.isfinite(depth) & (depth > 1e-6)
+                    veil_info = dict(empty=float(em_.float().mean()), veil_empty=float(vr_[em_].mean()) if bool(em_.any()) else 0.0,
+                                     veil_empty_above_half=float((vr_[em_] > 0.5).float().mean()) if bool(em_.any()) else 0.0,
+                                     veil_covered=float(vs_[~em_].mean()) if bool((~em_).any()) else 0.0,
+                                     depth_empty_over_covered=float(depth[em_ & zr_ok].median() / depth[~em_ & zr_ok].median().clamp_min(1e-6))
+                                     if bool((em_ & zr_ok).any()) and bool((~em_ & zr_ok).any()) else 0.0,
+                                     empty_without_depth=float((em_ & ~zr_ok).float().sum() / em_.float().sum().clamp_min(1.0)), prior=args.binf_prior)
+                print(f"[medium field] veil fit: {veil_info['empty']:.3f} of the map frame pixels have no primitive, their backbone depth is "
+                      f"{veil_info['depth_empty_over_covered']:.2f} times the depth of the covered pixels (median), veil share 1 - exp(-beta_B z) there "
+                      f"{veil_info['veil_empty']:.3f} (above 0.5 on {veil_info['veil_empty_above_half']:.2f} of them, no depth on "
+                      f"{veil_info['empty_without_depth']:.2f}), on the covered pixels {veil_info['veil_covered']:.3f}", flush=True)
             if "field" in want:
-                field = fit_medium_field(med, c2w, intr, h, w, iters=args.medium_iters)
+                field = (fit_medium_field(med, c2w, intr, h, w, iters=args.medium_iters) if obs_w is None else
+                         fit_medium_field(med, c2w, intr, h, w, iters=args.medium_iters, step=8, obs=obs_w, prior=args.binf_prior))
                 torch.save(field.state(), os.path.join(args.out_dir, "medium_field.pt"))
+                if veil_info is not None:
+                    veil_info["moved"] = binf_error(field, med, c2w, intr, list(range(n)), h, w)
+                    print(f"[medium field] veil fit: B_inf of the field differs from the B_inf of the head by {veil_info['moved']:.4f} on the map frames (mean absolute)", flush=True)
             if "views" in want:
                 views = ViewMedium(med, c2w, intr, h, w)
             medium_info = dict(ho, seconds=time.time() - tf)
+            if veil_info is not None:
+                medium_info["binf_veil"] = veil_info
             print(f"[medium field] B_inf error on {ho['n_left_out']} left out map frames: field {ho['field']:.4f}, views "
                   f"{ho['views']:.4f}, mean of the two nearest frames {ho['nearest']:.4f} | spread over the frames of params_D "
                   f"{ho['spread_params_D']:.4f}, of B_inf {ho['spread_binf']:.4f} | {medium_info['seconds']:.0f}s", flush=True)
@@ -360,11 +521,15 @@ def main():
     def at_time(t, gm=None):
         """The map gm (default g) at time t: the static and dynamic copies of a 4D scaffold (model/anchor_head.py
         slot_at_time) with xyz in Stage 1 units and means in render units, gm itself for a static map."""
+        if gm is None and tmaps and t is not None:
+            gm = tmaps[min(range(len(tmaps)), key=lambda j_: abs(tmaps[j_][0] - float(t)))][1]
         gm = g if gm is None else gm
-        if t is None or "gate" not in gm:
+        if t is None or "gate" not in gm or (float(gm.get("exist", 0.0) or 0.0) > 0.0 and args.exist_scale <= 0.0):
             return gm
         gt_ = slot_at_time(dict(means=gm["xyz"], opacity=gm["opacity"], scales=gm["scales"], quat=gm["quat"], J=gm["J"],
-                                beta=gm["beta"], gate=gm["gate"], tw=gm["tw"], tb=gm["tb"], vel=gm["vel"], t_src=gm["t_src"]), t)
+                                beta=gm["beta"], gate=gm["gate"], tw=gm["tw"] * (float(args.exist_scale) if gm.get("exist") else 1.0),
+                                tb=gm["tb"], vel=gm["vel"], t_src=gm["t_src"],
+                                transient=gm.get("transient", 0.0), exist=gm.get("exist", 0.0)), t)
         return dict(gt_, xyz=gt_["means"], means=gt_["means"] * unit)
 
     def rv(gg, colors, cu, f, hh, ww, bg, c):
@@ -373,12 +538,46 @@ def main():
                                     betas=gg["beta"], scale_factor=K_BETA4, eps2d=EPS2D_BETA4)
         return render_view(gg["means"], gg["opacity"], gg["scales"], gg["quat"], colors, cu, f, hh, ww, bg, pp=c)
 
+    def stack(t, gm):
+        if gm is not None:
+            return [gm]
+        fill = bool(args.time_fill and tmaps and t is not None)
+        return ([None, g] if fill else [None]) + ([g_far] if g_far is not None else [])
+
     def render(pose, m1, f=focal, c=pp, hw=(h, w), which="underwater", t=None, gm=None, alpha=False):
+        ls = stack(t, gm)
+        if len(ls) == 1 or not (args.medium_raster == "preshade" and (which == "restored" or "B_inf_map" in m1)):
+            return render_one(pose, m1, f, c, hw, which, t, gm, alpha)
+        img_, tr_ = 0.0, 1.0
+        if which == "restored":
+            cu_ = pose.clone()
+            cu_[:3, 3] = pose[:3, 3] * unit
+            for l_ in ls:
+                gl_ = at_time(t, l_)
+                r_, _, a_ = rv(gl_, gl_["J"], cu_, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+                img_ = img_ + tr_ * r_
+                tr_ = tr_ * (1.0 - a_.reshape(1, hw[0], hw[1]))
+            return img_
+        for l_ in ls:
+            o_, a_ = render_one(pose, m1, f, c, hw, which, t, l_, True, obj=True)
+            img_ = img_ + tr_ * o_
+            tr_ = tr_ * (1.0 - a_.reshape(1, hw[0], hw[1]))
+        img_ = img_ + tr_ * background(m1, hw[0], hw[1]).float()
+        return (img_, 1.0 - tr_[0]) if alpha else img_
+
+    def render_one(pose, m1, f=focal, c=pp, hw=(h, w), which="underwater", t=None, gm=None, alpha=False, obj=False):
         gg = at_time(t, gm)
         cu = pose.clone()
         cu[:3, 3] = pose[:3, 3] * unit
         if which == "restored":
             return rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)[0]
+        if args.medium_raster == "s2" and "beta" in gg:
+            with torch.no_grad():
+                _, dacc, a0 = rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+                m_rgb, m_bs, m_attn = MR.medium_maps(phys, m1, MR.expected_depth(dacc, a0, unit), unit)
+            img, _, _ = MR.render_medium_view(gg["means"], gg["opacity"], gg["scales"], gg["quat"], gg["J"], gg["beta"], cu, f, hw[0], hw[1],
+                                              c, m_rgb, m_bs, m_attn, scale_factor=K_BETA4, eps2d=EPS2D_BETA4, deconf=bool(args.grad_deconf))
+            return (img, a0.reshape(hw[0], hw[1])) if alpha else img
         xc = (gg["xyz"] - pose[:3, 3]) @ pose[:3, :3]
         zc = xc[:, 2]
         if "B_inf_map" not in m1:
@@ -391,6 +590,8 @@ def main():
         uv = torch.stack([(f * xc[:, 0] / zs + c[0]) * w / hw[1], (f * xc[:, 1] / zs + c[1]) * h / hw[0]], dim=-1)
         col = underwater_colours(phys, gg["J"], zc, m1, uv)
         img, _, alp = rv(gg, col, cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+        if obj:
+            return img, alp.reshape(hw[0], hw[1])
         img = img + (1.0 - alp.reshape(1, hw[0], hw[1])) * background(m1, hw[0], hw[1]).float()
         return (img, alp.reshape(hw[0], hw[1])) if alpha else img
 
@@ -424,9 +625,15 @@ def main():
 
     out = {"scene": args.scene_dir, "head": src, "lora": args.lora, "physics": args.physics, "frames_in_map": n,
            "primitives_before_fusion": n_in, "primitives": g["n_out"], "seconds_map": t_map, "stage1_restored_frames": n_s1,
-           "beta_D_scale": args.phys_beta_D_scale, "medium": modes, "medium_primary": modes[0], "medium_field": medium_info,
+           "beta_D_scale": args.phys_beta_D_scale, "medium": modes, "medium_primary": modes[0], "medium_field": medium_info, "far_layer": int(g_far["n_out"]) if g_far is not None else 0,
+           "medium_raster": args.medium_raster if "beta" in g else "preshade",
+           "time_fill": bool(args.time_fill and tmaps),
+           "time_bucket": ({"frames": int(args.time_bucket), "windows": len(tmaps), "primitives_all_windows": int(sum(m_["n_out"] for _, m_ in tmaps)),
+                            "primitives_per_window": float(np.mean([m_["n_out"] for _, m_ in tmaps]))} if tmaps else None),
            "scaffold_mode": None if anchor is None or not getattr(anchor, "scaffold", False) else ("always on" if anchor.cfg.get("always_on") else anchor.mode),
-           "beta_fixed": float(getattr(anchor, "cfg", {}).get("beta_fixed", 0.0) or 0.0) if anchor is not None else 0.0}
+           "beta_fixed": float(getattr(anchor, "cfg", {}).get("beta_fixed", 0.0) or 0.0) if anchor is not None else 0.0,
+           "anchor_cfg": dict(anchor.cfg) if anchor is not None else None}
+    refined = []
     with torch.no_grad():
         for mode in modes:
             own, own_r = [], []
@@ -443,6 +650,21 @@ def main():
             print("[map frames%s] underwater %.2f / %.4f / %.4f" % (tag[mode], *out["map_frames_underwater" + sfx[mode]])
                   + (" | restored against the Stage 1 restored frame %.2f / %.4f / %.4f" % tuple(out["map_frames_restored_vs_stage1"])
                      if own_r else ""), flush=True)
+        if "beta" in g and args.medium_raster == "s2":
+            pair, other = [], []
+            for i in range(0, n, max(1, n // 12)):
+                fi, ci = float(intr[i, 0, 0]), (float(intr[i, 0, 2]) + 0.5, float(intr[i, 1, 2]) + 0.5)
+                m1 = medium_for(modes[0], fnums[i], c2w[i], fi, ci)
+                r_s2 = render(c2w[i], m1, fi, ci, t=fnums[i] / args.fps)
+                args.medium_raster = "preshade"
+                r_pre = render(c2w[i], m1, fi, ci, t=fnums[i] / args.fps)
+                args.medium_raster = "s2"
+                pair.append(float(-10.0 * torch.log10((r_s2.clamp(0, 1) - r_pre.clamp(0, 1)).square().mean() + 1e-12)))
+                other.append(score(r_pre, imgs[i]))
+            out["raster_check"] = {"psnr_s2_against_preshade": float(np.mean(pair)), "psnr_min": float(np.min(pair)),
+                                   "map_frames_underwater_preshade": np.mean(other, 0).tolist()}
+            print("[raster] s2 against preshade on %d map frames: %.2f dB (lowest %.2f) | preshade underwater %.2f / %.4f / %.4f"
+                  % (len(pair), np.mean(pair), np.min(pair), *out["raster_check"]["map_frames_underwater_preshade"]), flush=True)
 
     if diag_idx:
         def psnr_m(img, gt_, m=None):
@@ -507,13 +729,7 @@ def main():
                 m0 = medium_for(mode, num, p0)
                 with torch.no_grad():
                     before = score(render(p0, m0, t=num / args.fps), gt)
-                if dev.type == "cuda":
-                    torch.cuda.synchronize()
-                tl = time.time()
                 p1 = refine(p0, gt, m0, t=num / args.fps)
-                if dev.type == "cuda":
-                    torch.cuda.synchronize()
-                tl = time.time() - tl
                 with torch.no_grad():
                     m1 = medium_for(mode, num, p1)
                     pred = render(p1, m1, t=num / args.fps)
@@ -527,8 +743,9 @@ def main():
                         Image.fromarray((row.permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)).save(
                             os.path.join(args.out_dir, "%s_gt_underwater_restored%s.jpg" % (os.path.splitext(name)[0], sfx[mode])),
                             quality=92)
-                rows.append({"frame": num, "centre": num in centre, "dist": min(abs(num - k) for k in fnums), "before": before, "after": after,
-                             "seconds": tl})
+                if mode == modes[0] and len(refined) < args.gate_test:
+                    refined.append((num, p1, m1, gt))
+                rows.append({"frame": num, "centre": num in centre, "dist": min(abs(num - k) for k in fnums), "before": before, "after": after})
                 print("%06d %s%s before %.2f / %.4f / %.4f after %.2f / %.4f / %.4f" % (
                     num, "centre" if num in centre else "side  ", tag[mode], *before, *after), flush=True)
 
@@ -544,13 +761,58 @@ def main():
                 if a:
                     print("[%s%s] n %d | underwater before %.3f / %.4f / %.4f after %.3f / %.4f / %.4f" % (
                         k, tag[mode], a["n"], *a["before"], *a["after"]))
-            sec = [r["seconds"] for r in rows]
-            out["loc_seconds" + s] = {"mean": float(np.mean(sec)), "median": float(np.median(sec)), "max": float(np.max(sec)),
-                                      "frames": len(sec), "steps": int(args.pose_iters)}
-            print("[time%s] pose refinement of one held out frame: mean %.2f s, median %.2f s, max %.2f s over %d frames (%d steps each)" % (
-                tag[mode], np.mean(sec), np.median(sec), np.max(sec), len(sec), args.pose_iters), flush=True)
+    if args.overlap > 0:
+        import map_overlap as MO
+        with torch.no_grad():
+            ov = MO.overlap_stats(g["xyz"].cpu().numpy(), (g["scales"] / unit).cpu().numpy(), g["beta"].cpu().numpy() if "beta" in g else None)
+            rows = {1: [], 2: [], 4: []}
+            for i in sorted(set(np.linspace(0, n - 1, args.overlap).round().astype(int).tolist())):
+                fi, ci = float(intr[i, 0, 0]), (float(intr[i, 0, 2]) + 0.5, float(intr[i, 1, 2]) + 0.5)
+                m_own = med_of([i])
+                solid = (conf[i] > args.min_conf_thr)[None].float()
+                for zf in rows:
+                    _, alp = render(c2w[i], m_own, fi * zf, (zf * (ci[0] - 0.5 * w * (1 - 1 / zf)), zf * (ci[1] - 0.5 * h * (1 - 1 / zf))),
+                                    t=fnums[i] / args.fps, alpha=True)
+                    x0, y0 = 0.5 * w * (1 - 1 / zf), 0.5 * h * (1 - 1 / zf)
+                    ys = ((torch.arange(h, device=dev) + 0.5) / zf + y0).long().clamp(0, h - 1)
+                    xs = ((torch.arange(w, device=dev) + 0.5) / zf + x0).long().clamp(0, w - 1)
+                    m = solid[0][ys][:, xs] > 0.5
+                    if int(m.sum()) >= 50:
+                        rows[zf].append(float((alp[m] > 0.5).float().mean()))
+            ov["cover"] = {f"x{zf}": float(np.mean(v)) if v else None for zf, v in rows.items()}
+        out["overlap"] = ov
+        print(f"[overlap] sigma over the nearest neighbour distance, percentiles 10 / 50 / 90: largest axis "
+              f"{' / '.join('%.2f' % v for v in ov['major_over_nn'])}, middle axis {' / '.join('%.2f' % v for v in ov['middle_over_nn'])} | "
+              f"confident pixels with alpha > 0.5 at 1x / 2x / 4x focal: {ov['cover']['x1']} / {ov['cover']['x2']} / {ov['cover']['x4']}", flush=True)
+    if args.gate_test > 0 and anchor is not None and "gate" in g and "slot" in g:
+        import gate_metric as GM
+        with torch.no_grad():
+            kind = GM.slot_kind(g["slot"], anchor.cells)
+            cs = GM.cross_frame_scores(g["xyz"], g["raw"], imgs, depth, conf, intr, c2w, args.min_conf_thr)
+            seen = cs["n_seen"] >= 3
+            gt_ = dict(type_r2=GM.type_r2(g["gate"], kind), slots_seen_by_3_frames=float(seen.float().mean()),
+                       see_through_mean=float(cs["see_through"][seen].mean()),
+                       auc_see_through=GM.within_type_auc(g["gate"][seen], cs["see_through"][seen], kind[seen]),
+                       auc_colour=GM.within_type_auc(g["gate"][seen], cs["resid"][seen], kind[seen]))
+            gen = torch.Generator().manual_seed(0)
+            gates = dict(map=g["gate"], shuffled=GM.shuffle_within_type(g["gate"].cpu(), kind.cpu(), gen).to(dev), zero=torch.zeros_like(g["gate"]))
+            ps = {k: [] for k in gates}
+            for num, p1, m1, gt in refined:
+                for k, gv in gates.items():
+                    ps[k].append(score(render(p1, m1, t=num / args.fps, gm=dict(g, gate=gv)), gt)[0])
+            gt_.update(frames=[r[0] for r in refined], psnr={k: float(np.mean(v)) if v else None for k, v in ps.items()})
+            if refined:
+                gt_["psnr_map_minus_shuffled"] = gt_["psnr"]["map"] - gt_["psnr"]["shuffled"]
+                gt_["psnr_map_minus_zero"] = gt_["psnr"]["map"] - gt_["psnr"]["zero"]
+        out["gate_test"] = gt_
+        print(f"[gate test] kind explains {gt_['type_r2']:.3f} of the gate variance | rank agreement inside a kind (0.5 = none): see "
+              f"through {gt_['auc_see_through']['mean']:.3f}, colour change {gt_['auc_colour']['mean']:.3f} | held out PSNR on "
+              f"{len(refined)} frames: map gate {gt_['psnr']['map']}, shuffled inside a kind {gt_['psnr']['shuffled']}, gate 0 {gt_['psnr']['zero']}",
+              flush=True)
     u8 = lambda c: (c.clamp(0, 1) * 255).round().byte().cpu().numpy()
     extra = {k: g[k].detach().float().cpu().numpy() for k in ("beta", "gate", "tw", "tb", "vel", "t_src") if k in g}
+    if "slot" in g:
+        extra["slot"] = g["slot"].cpu().numpy().astype(np.int16)
     np.savez_compressed(os.path.join(args.out_dir, "map.npz"), xyz=g["xyz"].float().cpu().numpy(),
                         scales=(g["scales"] / unit).half().cpu().numpy(), quat=g["quat"].half().cpu().numpy(),
                         opacity=g["opacity"].reshape(-1).half().cpu().numpy(), color_raw=u8(g["raw"]), color_clean=u8(g["J"]),
@@ -568,12 +830,16 @@ def main():
             load=lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev),
             medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score))
         mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
+        n_far = int(g_far["n_out"]) if g_far is not None else 0
+        n_win = int(sum(m_["n_out"] for _, m_ in tmaps)) if tmaps else 0
         text = bench_loc.report(res, dict(
-            scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]), warmup=args.bench_warmup,
-            kernel="Beta" if "beta" in g else "Gaussian", dynamic="gate" in g,
-            map_mb=sum(g[k].numel() for k in ("xyz", "scales", "quat", "opacity", "J", "beta", "gate", "tw", "tb", "vel", "t_src") if k in g) * 4 / 1e6,
+            scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, warmup=args.bench_warmup,
+            kernel="Gaussian", dynamic=("gate" in g and not g.get("transient") and not g.get("exist")),
+            map_mb=sum(g[k].numel() for k in ("xyz", "scales", "quat", "opacity", "J", "gate", "tw", "tb", "vel", "t_src") if k in g) * 4 / 1e6,
             map_file_mb=mb(os.path.join(args.out_dir, "map.npz")), mapping_seconds=args.bench_mapping_seconds,
             weights_mb={"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}))
+        text += (f"\nrender path {args.medium_raster}, veil fit {'on' if args.binf_veil else 'off'}, time windows "
+                 f"{args.time_bucket if tmaps else 0} ({n_win} primitives), far layer {n_far} primitives")
         open(os.path.join(args.out_dir, "benchmark.txt"), "w").write(text + "\n")
         out["bench"] = res
     if dev.type == "cuda":

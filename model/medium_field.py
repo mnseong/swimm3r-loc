@@ -164,9 +164,14 @@ class ViewMedium:
         return float(seen.float().mean())
 
 
-def _samples(med, c2w, intr, idx, h, w, step):
+def veil_residual(binf, img, known, gain, slack):
+    lo = known + binf * gain
+    return torch.relu(lo - img) + torch.relu(img - lo - slack)
+
+
+def _samples(med, c2w, intr, idx, h, w, step, obs=None):
     """Rays (N, 3), camera centres (N, 3) and B_inf targets (N, 3) of the frames idx on a grid every step pixels."""
-    D, P, T = [], [], []
+    D, P, T, O = [], [], [], []
     for i in idx:
         f, pp = float(intr[i, 0, 0]), (float(intr[i, 0, 2]) + 0.5, float(intr[i, 1, 2]) + 0.5)
         d = pixel_dirs(c2w[i], f, pp, h, w, step)
@@ -175,13 +180,18 @@ def _samples(med, c2w, intr, idx, h, w, step):
             t = mp[:, step // 2::step, step // 2::step][:, :d.shape[0], :d.shape[1]].permute(1, 2, 0)
         else:
             t = med["B_inf"][i][None, None].expand(d.shape[0], d.shape[1], 3)
+        if obs is not None:
+            cut = lambda a_: a_[..., step // 2::step, step // 2::step][..., :d.shape[0], :d.shape[1]].permute(1, 2, 0).reshape(-1, 3)
+            O.append(torch.stack([cut(obs[k][i]).to(t.dtype) for k in ("img", "known", "gain", "slack")]))
         D.append(d.reshape(-1, 3))
         P.append(c2w[i, :3, 3].expand(d.shape[0] * d.shape[1], 3))
         T.append(t.reshape(-1, 3))
+    if obs is not None:
+        return torch.cat(D), torch.cat(P), torch.cat(T), torch.cat(O, dim=1)
     return torch.cat(D), torch.cat(P), torch.cat(T)
 
 
-def fit_medium_field(med, c2w, intr, h, w, train_idx=None, step=16, iters=1500, lr=5e-3, seed=0, **cfg):
+def fit_medium_field(med, c2w, intr, h, w, train_idx=None, step=16, iters=1500, lr=5e-3, seed=0, obs=None, prior=0.06, **cfg):
     """Field fitted to the media med (from training/physics_splat.medium) of the frames train_idx (all by default)
     with cameras c2w (n, 4, 4) and intrinsics intr (n, 3, 3) at the image size h x w."""
     n = c2w.shape[0]
@@ -202,15 +212,25 @@ def fit_medium_field(med, c2w, intr, h, w, train_idx=None, step=16, iters=1500, 
     if "beta_D_scale" in med:
         field.beta_D_scale.copy_(torch.as_tensor(med["beta_D_scale"], dtype=torch.float32).reshape(3))
         field.has_scale = True
-    D, P, T = _samples(med, c2w.float(), intr.float(), idx, h, w, step)
+    Ob = None
+    if obs is None:
+        D, P, T = _samples(med, c2w.float(), intr.float(), idx, h, w, step)
+    else:
+        D, P, T, Ob = _samples(med, c2w.float(), intr.float(), idx, h, w, step, obs=obs)
     field.binf_mean.copy_(T.mean(0).clamp(1e-3, 1 - 1e-3))
     opt = torch.optim.Adam(field.mlp.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
     perm = torch.randperm(D.shape[0], generator=g).to(dev)
     D, P, T = D[perm], P[perm], T[perm]
+    if Ob is not None:
+        Ob = Ob[:, perm]
     for _ in range(iters):
         opt.zero_grad(set_to_none=True)
-        loss = (field(D, P) - T).abs().mean()
+        if Ob is None:
+            loss = (field(D, P) - T).abs().mean()
+        else:
+            pr = field(D, P)
+            loss = veil_residual(pr, Ob[0], Ob[1], Ob[2], Ob[3]).square().mean() + prior * (pr - T).square().mean()
         loss.backward()
         opt.step()
         sched.step()
