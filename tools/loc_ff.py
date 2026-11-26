@@ -23,6 +23,15 @@ def encode_frames(net, imgs, chunk=4):
     return torch.cat(out)
 
 
+def desc_only(net, num, dec, hw):
+    head = net.downstream_head1 if num == 1 else net.downstream_head2
+    x = torch.cat([dec[0], dec[-1]], dim=-1)
+    ps = int(head.patch_size)
+    f = head.head_local_features(x).transpose(-1, -2).reshape(x.shape[0], -1, hw[0] // ps, hw[1] // ps)
+    f = F.pixel_shuffle(f, ps).permute(0, 2, 3, 1)[..., :int(head.local_feat_dim)]
+    return f / f.norm(dim=-1, keepdim=True)
+
+
 class Localizer:
     def __init__(self, net, tokens, depth, conf, intr, c2w, focal, pp, min_conf, dev, subsample=8, reproj=None, name="ours", points=2000):
         n, h, w = depth.shape
@@ -55,6 +64,34 @@ class Localizer:
         self.subsample = int(subsample)
         self.reproj = float(reproj) if reproj else 0.008 * float(np.hypot(h, w))
         self.pos = None
+        self.lean_ok, self.lean_diff, self.half_ok = None, None, None
+
+    def amp(self, half):
+        return torch.autocast("cuda", dtype=torch.float16, enabled=bool(half) and self.dev.type == "cuda")
+
+    def descriptors(self, d1, d2, sh, lean):
+        d1, d2 = [t.float() for t in d1], [t.float() for t in d2]
+        hw = (self.h, self.w)
+        if lean and self.lean_ok is None:
+            try:
+                if self.h > self.w:
+                    raise ValueError("portrait frames go through the full head")
+                with torch.autocast("cuda", enabled=False):
+                    full = self.net._downstream_head(1, d1, sh)["desc"], self.net._downstream_head(2, d2, sh)["desc"]
+                    mine = desc_only(self.net, 1, d1, hw), desc_only(self.net, 2, d2, hw)
+                self.lean_diff = float(max((a - b).abs().max() for a, b in zip(full, mine)))
+                self.lean_ok = bool(self.lean_diff < 1e-3)
+                print("[loc] %s: descriptors without the pointmap branch differ from the full head by at most %.1e, %s" % (
+                    self.name, self.lean_diff, "used from here on" if self.lean_ok else "not used"), flush=True)
+                return full
+            except Exception as e:
+                self.lean_ok = False
+                print("[loc] %s: descriptors without the pointmap branch are not available (%s: %s), the full head is used" % (
+                    self.name, type(e).__name__, e), flush=True)
+        with torch.autocast("cuda", enabled=False):
+            if lean and self.lean_ok:
+                return desc_only(self.net, 1, d1, hw), desc_only(self.net, 2, d2, hw)
+            return self.net._downstream_head(1, d1, sh)["desc"], self.net._downstream_head(2, d2, sh)["desc"]
 
     def sub(self, keep):
         import copy
@@ -73,8 +110,9 @@ class Localizer:
         return {"tokens": self.tokens.numel() * self.tokens.element_size() / 1e6, "points": self.xyz.numel() * 4 / 1e6}
 
     @torch.no_grad()
-    def encode(self, img):
-        f, pos, _ = self.net._encode_image(img[None] * 2.0 - 1.0, self.shape)
+    def encode(self, img, half=False):
+        with self.amp(half):
+            f, pos, _ = self.net._encode_image(img[None] * 2.0 - 1.0, self.shape)
         self.pos = pos
         return f
 
@@ -96,22 +134,21 @@ class Localizer:
         return torch.argsort(score, descending=True)[:k].tolist(), score
 
     @torch.no_grad()
-    def match(self, fq, idx):
+    def match(self, fq, idx, lean=False, half=False):
         from mast3r.fast_nn import fast_reciprocal_NNs
         k = len(idx)
         ii = torch.as_tensor(idx, device=self.dev, dtype=torch.long)
         pos = self.pos.expand(k, -1, -1)
         t0 = time.time()
-        d1, d2 = self.net._decoder(fq.expand(k, -1, -1), pos, self.tokens[ii].to(fq.dtype), pos)
+        with self.amp(half):
+            d1, d2 = self.net._decoder(fq.expand(k, -1, -1), pos, self.tokens[ii].to(fq.dtype), pos)
         sh = self.shape.expand(k, 2)
-        with torch.autocast("cuda", enabled=False):
-            r1 = self.net._downstream_head(1, [t.float() for t in d1], sh)
-            r2 = self.net._downstream_head(2, [t.float() for t in d2], sh)
+        desc1, desc2 = self.descriptors(d1, d2, sh, lean)
         sync(self.dev)
         t1 = time.time()
         p2d, p3d, found = [], [], 0
         for j, i in enumerate(idx):
-            xm, xq = fast_reciprocal_NNs(r2["desc"][j], r1["desc"][j], subsample_or_initxy1=self.subsample, ret_xy=True,
+            xm, xq = fast_reciprocal_NNs(desc2[j], desc1[j], subsample_or_initxy1=self.subsample, ret_xy=True,
                                          device=self.dev, dist="dot", block_size=2 ** 13)
             found += len(xm)
             if len(xm) == 0:
@@ -127,20 +164,20 @@ class Localizer:
         return np.concatenate(p2d), np.concatenate(p3d), found, t1 - t0, t2 - t1
 
     @torch.no_grad()
-    def match_render(self, fq, img, depth, alpha, pose, min_alpha=0.5):
+    def match_render(self, fq, img, depth, alpha, pose, min_alpha=0.5, lean=False, half=False):
         from mast3r.fast_nn import fast_reciprocal_NNs
         sync(self.dev)
         t0 = time.time()
-        fr, _, _ = self.net._encode_image(img[None].clamp(0.0, 1.0) * 2.0 - 1.0, self.shape)
+        with self.amp(half):
+            fr, _, _ = self.net._encode_image(img[None].clamp(0.0, 1.0) * 2.0 - 1.0, self.shape)
         sync(self.dev)
         t1 = time.time()
-        d1, d2 = self.net._decoder(fq, self.pos, fr.to(fq.dtype), self.pos)
-        with torch.autocast("cuda", enabled=False):
-            r1 = self.net._downstream_head(1, [t.float() for t in d1], self.shape)
-            r2 = self.net._downstream_head(2, [t.float() for t in d2], self.shape)
+        with self.amp(half):
+            d1, d2 = self.net._decoder(fq, self.pos, fr.to(fq.dtype), self.pos)
+        desc1, desc2 = self.descriptors(d1, d2, self.shape, lean)
         sync(self.dev)
         t2 = time.time()
-        xm, xq = fast_reciprocal_NNs(r2["desc"][0], r1["desc"][0], subsample_or_initxy1=self.subsample, ret_xy=True,
+        xm, xq = fast_reciprocal_NNs(desc2[0], desc1[0], subsample_or_initxy1=self.subsample, ret_xy=True,
                                      device=self.dev, dist="dot", block_size=2 ** 13)
         found = len(xm)
         p2d, p3d = np.zeros((0, 2)), np.zeros((0, 3))
@@ -155,11 +192,12 @@ class Localizer:
         sync(self.dev)
         return p2d, p3d, int(found), dict(encoder=t1 - t0, decoder=t2 - t1, matching=time.time() - t2)
 
-    def localize(self, img, prior=None, idx=None, topk=1):
+    def localize(self, img, prior=None, idx=None, topk=1, lean=False, half=False, fq=None):
         t = {}
         sync(self.dev)
         a = time.time()
-        fq = self.encode(img)
+        if fq is None:
+            fq = self.encode(img, half=half)
         sync(self.dev)
         t["encoder"] = time.time() - a
         a = time.time()
@@ -170,7 +208,7 @@ class Localizer:
                 idx, _ = self.retrieve(fq, topk)
                 sync(self.dev)
         t["select"] = time.time() - a
-        p2d, p3d, found, t["decoder"], t["matching"] = self.match(fq, idx)
+        p2d, p3d, found, t["decoder"], t["matching"] = self.match(fq, idx, lean=lean, half=half)
         a = time.time()
         start = np.asarray(prior, dtype=np.float64) if prior is not None else self.poses[idx[0]]
         sol = G.solve_pnp(p3d, p2d, self.K, self.reproj, start) if len(p2d) >= 6 else None

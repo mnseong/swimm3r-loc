@@ -10,6 +10,7 @@ import torch
 import bench_loc as B
 import bench_proto as P
 import eval_gaussian_map as E
+import loc_fast as LF
 import loc_geom as G
 import loc_ref as R
 import loc_warp as Wp
@@ -281,6 +282,61 @@ def run(ctx):
         except Exception as e:
             res["notes"].append("public MASt3R failed: %s: %s" % (type(e).__name__, e))
 
+    if ctx.get("fast", True) and tests:
+        fk = dict(topk=int(ctx.get("fast_topk", 2)), photo=str(ctx.get("fast_photo", "lcn")), levels=tuple(ctx.get("fast_levels", (3, 2, 1))),
+                  iters=tuple(ctx.get("fast_iters", (5, 4, 3))))
+        chk = dict(ctx.get("fast_check") or {})
+        at = lambda which: (lambda p, i: rgbd(p, map_nums[i], which))
+        half = dev.type == "cuda"
+        if half:
+            try:
+                loc.match(loc.encode(imgs[0], half=True), [0], lean=True, half=True)
+            except Exception as e:
+                half = False
+                res["notes"].append("half precision is not usable here: %s: %s" % (type(e).__name__, e))
+        info = dict(options=dict(fk, check=chk), half=bool(half))
+
+        def timed(label, family, fn, keep=None):
+            try:
+                fn(imgs[0])
+                rows, w0 = [], time.time()
+                for j in range(len(tests)):
+                    r = fn(imgs[j])
+                    r.pop("fq", None)
+                    rows.append(dict(ok=bool(r["ok"]), sec=r["seconds"], pose=np.asarray(r["pose"], dtype=np.float64), num=map_nums[r["idx"][0]], raw=r))
+                win_f = (w0, time.time())
+                for j, r in enumerate(rows):
+                    r["ev"] = evaluate(j, r["pose"], r["num"])
+                add(label, family, rows, win_f)
+                if keep:
+                    use = [r["raw"] for r in rows[min(warm, max(len(rows) - 1, 0)):]]
+                    mean = lambda f: float(np.mean([f(x) for x in use]))
+                    st = {k: mean(lambda x, k=k: x["stages"].get(k, 0.0)) for k in ("encoder", "tokens", "pnp", "render", "align", "select", "decoder", "matching")}
+                    st.update({"fallback_" + k: mean(lambda x, k=k: x["stages"].get("fallback_" + k, 0.0)) for k in ("decoder", "matching", "pnp")})
+                    extra = {}
+                    if "corr" in use[0]:
+                        extra = dict(matches=mean(lambda x: x["matches"]), inliers=mean(lambda x: x["inliers"]), steps=mean(lambda x: x["steps"]),
+                                     corr=float(np.median([x["corr"] for x in use if x["corr"] is not None])) if any(x["corr"] is not None for x in use) else None,
+                                     valid=mean(lambda x: x["valid"]), fallback=mean(lambda x: 100.0 * float(x.get("fallback", False))))
+                    info[keep] = dict(stages=st, **extra)
+            except Exception as e:
+                res["notes"].append("%s failed: %s: %s" % (label, type(e).__name__, e))
+
+        timed("no render, descriptor branch only", "lean", lambda im: loc.localize(im, topk=1, lean=True), "lean")
+        if half:
+            timed("no render, branch only, half prec.", "lean", lambda im: loc.localize(im, topk=1, lean=True, half=True), "lean_half")
+        timed("fast: tokens, PnP, direct alignment", "fast", lambda im: LF.localize_fast(loc, im, at("underwater"), **fk), "fast")
+        timed("fast + check (decoder when it fails)", "fast", lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, **fk), "tiered")
+        if half:
+            timed("fast + check, half precision", "fast", lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, half=True, **fk), "tiered_half")
+        if ctx.get("ablation", True):
+            timed("fast, render without the water model", "fast", lambda im: LF.localize_fast(loc, im, at("restored"), **fk))
+        if ctx.get("loc_public") is not None:
+            timed("public MASt3R: tokens, PnP, alignment", "public", lambda im: LF.localize_fast(ctx["loc_public"], im, at("underwater"), **fk))
+        info.update(lean_ok=loc.lean_ok, lean_diff=loc.lean_diff)
+        res["fast"] = info
+        save()
+
     ram = [r for r in tegra.window(0, time.time()) if "ram_used_mb" in r]
     tegra.stop()
     peak = torch.cuda.max_memory_allocated() if dev.type == "cuda" else 0
@@ -369,6 +425,34 @@ def report(res, info):
                   s["steps"], 1e3 * s["refine_steps"], s["rerenders"]),
               "   coarse stage: %.0f inliers of %.0f matches on average, stopped before the last pass for %.0f %% of the queries | the mask keeps %.0f %% of the pixels" % (
                   s["inliers"], s["matches"], s["converged"], s["mask_share"])]
+    fa = res.get("fast")
+    if fa:
+        o = fa["options"]
+        L += ["-" * W, " Fast path   one encoder pass of the query and no decoder: its tokens are matched to the tokens of the best %d map frames (mutual nearest" % o["topk"],
+              "             neighbours, refined inside the 3 x 3 neighbours), the matches are lifted by the points of the map at the token centres and PnP gives a",
+              "             first pose. The query is then aligned directly to the underwater render of the map at that pose, Gauss-Newton on %s over the" % (
+                  "the locally normalised intensity" if o["photo"] == "lcn" else "the colours with one gain and offset per channel"),
+              "             pyramid levels 1/%s, no network. The check accepts the result or sends the query through the decoder (descriptor branch only)." % (
+                  ", 1/".join(str(2 ** int(x)) for x in o["levels"]))]
+        ms = lambda d, k: 1e3 * d["stages"].get(k, 0.0)
+        for key, name in (("fast", "fast"), ("tiered", "fast + check"), ("tiered_half", "fast + check, half precision")):
+            d = fa.get(key)
+            if not d:
+                continue
+            L.append("   %-28s encoder %.0f ms | tokens %.0f ms | PnP %.0f ms | render %.0f ms | alignment %.0f ms in %.1f steps | %.0f inliers of %.0f token matches | "
+                     "correlation %s" % (name, ms(d, "encoder"), ms(d, "tokens"), ms(d, "pnp"), ms(d, "render"), ms(d, "align"), d["steps"], d["inliers"], d["matches"],
+                                         fmt(d.get("corr"), "%.2f")))
+            if key != "fast":
+                L.append("   %-28s %.0f %% of the queries fail the check and go through the decoder (mean over all queries: decoder %.0f ms, matching %.0f ms, PnP %.0f ms)" % (
+                    "", d["fallback"], ms(d, "fallback_decoder"), ms(d, "fallback_matching"), ms(d, "fallback_pnp")))
+        for key, name in (("lean", "descriptor branch only"), ("lean_half", "branch only, half precision")):
+            d = fa.get(key)
+            if d:
+                L.append("   %-28s encoder %.0f ms | map frame choice %.1f ms | decoder and heads %.0f ms | matching %.0f ms | PnP %.0f ms" % (
+                    name, ms(d, "encoder"), ms(d, "select"), ms(d, "decoder"), ms(d, "matching"), ms(d, "pnp")))
+        L.append("   the descriptors without the pointmap branch %s; half precision %s" % (
+            "differ from the full head by at most %.1e" % fa["lean_diff"] if fa.get("lean_ok") else "are not available here, those rows use the full head",
+            "available" if fa.get("half") else "not available on this device"))
     m = res["memory"]
     L += ["-" * W, " Footprint   GPU memory peak %.2f GiB allocated (%.2f GiB during localization) | process memory peak %.2f GiB" % (
         m["gpu_peak_gib"], m["gpu_peak_localization_gib"], m["rss_peak_gib"])]
@@ -393,7 +477,8 @@ def report(res, info):
           " brightness fit' is not in the paper: before every step one gain and offset per colour channel is fitted between the warped query and the render.",
           " 'no water model' renders the restored colours of the map without the medium in both stages. 'no render' matches the query to the retrieved",
           " map frame itself, with no rendering at all.",
-          " 'public MASt3R matcher' runs the same pipeline on the same map with the public weights for the retrieval and the matching."]
+          " 'public MASt3R matcher' runs the same pipeline on the same map with the public weights for the retrieval and the matching.",
+          " 'descriptor branch only' skips the pointmap regression of both views, which localization never reads; the descriptors are the same."]
     for n in res.get("notes", []):
         L.append(" note: %s" % n)
     L.append("=" * W)

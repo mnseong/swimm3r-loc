@@ -231,6 +231,13 @@ def main():
     ap.add_argument("--gscpe_lr", type=float, default=3e-4)
     ap.add_argument("--gscpe_views", type=int, default=4, help="--gscpe: nearby views that vote the visibility mask")
     ap.add_argument("--gscpe_no_ablation", action="store_true", help="--gscpe: leave out the rows without the pyramid, the mask and the water model")
+    ap.add_argument("--gscpe_no_fast", action="store_true", help="--gscpe: leave out the rows of the fast path (tools/loc_fast.py)")
+    ap.add_argument("--fast_topk", type=int, default=2, help="--gscpe fast path: map frames whose tokens are matched to the tokens of the query")
+    ap.add_argument("--fast_photo", choices=("lcn", "affine"), default="lcn",
+                    help="--gscpe fast path: the direct alignment compares the locally normalised intensity (lcn) or the colours with one gain "
+                         "and offset per channel (affine)")
+    ap.add_argument("--fast_min_corr", type=float, default=0.25,
+                    help="--gscpe fast path: the check accepts a pose when render and query correlate at least this much after the alignment")
     ap.add_argument("--gscpe_depth_m", type=float, default=None,
                     help="--gscpe: median depth of the map in metres when it is known, the table is then also given in cm")
     ap.add_argument("--map_holdout", default=None,
@@ -991,7 +998,8 @@ def main():
                 medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score, loc=loc, loc_public=loc_pub,
                 out_dir=args.out_dir, ref_poses=ref_poses, ref_fit=ref_fit, ref_source=ref_src[2], coarse_iters=args.gscpe_passes,
                 levels=args.gscpe_levels, steps=args.gscpe_steps, lr=args.gscpe_lr, views=args.gscpe_views,
-                ablation=not args.gscpe_no_ablation, depth_m=args.gscpe_depth_m))
+                ablation=not args.gscpe_no_ablation, depth_m=args.gscpe_depth_m, fast=not args.gscpe_no_fast, fast_topk=args.fast_topk,
+                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr)))
             gtext = bench_gscpe.report(gres, dict(
                 scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
                 mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,

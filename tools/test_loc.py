@@ -229,7 +229,7 @@ def check_gscpe():
     fit = dict(n=len(mapf), scale=1.0, t_med=0.0, t_max=0.0, r_med=0.0, r_max=0.0)
     ctx = dict(dev=dev, tests=[name(i) for i in hold] + ["999999.jpg"], fps=5.0, warmup=1, map_nums=mapf, load=load, medium=lambda num, pose: {},
                render=strict, score=score, loc=loc, loc_public=loc, out_dir=out_dir, ref_poses={name(i): truth[i] for i in hold}, ref_fit=fit,
-               ref_source="truth", depth_m=2.0)
+               ref_source="truth", depth_m=2.0, fast=False)
     res = C.run(ctx)
     info = dict(scene="synthetic scene", map_frames=len(mapf), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in", mapping_seconds=None,
                 weights_mb={"none": 0.0}, reference="true poses of the synthetic scene", split="test : train = 1 : %.1f" % (len(mapf) / len(hold)))
@@ -310,7 +310,7 @@ def check_register():
         return [float(-10.0 * torch.log10(((img.clamp(0, 1) - gt) ** 2).mean() + 1e-12)), 1.0 - mae, mae]
 
     res = C.run(dict(dev=dev, tests=tests, fps=5.0, warmup=1, map_nums=mapf, load=load, medium=lambda num, pose: {}, render=strict, score=score, loc=loc,
-                     loc_public=None, out_dir=out_dir, ref_poses=poses, ref_fit=fit, ref_source="registration", ablation=False))
+                     loc_public=None, out_dir=out_dir, ref_poses=poses, ref_fit=fit, ref_source="registration", ablation=False, fast=False))
     text = C.report(res, dict(scene="synthetic scene", map_frames=len(mapf), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in", mapping_seconds=None,
                               weights_mb={"none": 0.0}, reference="every query registered into the fixed map", split="test : train = 1 : 3.3"))
     print(text[text.index(" Reference"):text.index(" Pipeline")])
