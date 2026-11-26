@@ -278,7 +278,7 @@ def direct_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3),
                 R, t = Rw @ R, Rw @ t + scale * xi[:3]
                 steps += 1
                 last = float(max(np.linalg.norm(xi[:3]), np.linalg.norm(xi[3:])))
-                am, qm = av - av.mean(), q - q.mean()
+                am, qm = av - av.mean(1, keepdim=True), q - q.mean(1, keepdim=True)
                 corr = float((am * qm).sum() / (am.norm() * qm.norm()).clamp_min(1e-12))
                 valid = n_use / float(hs * ws)
                 if last < tol:

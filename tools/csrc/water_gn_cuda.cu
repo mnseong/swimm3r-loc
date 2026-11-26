@@ -20,8 +20,8 @@ __device__ void wgn_block_add(float (*sh)[WGN_THREADS], const float* vals, doubl
     for (int k = 0; k < K; ++k) atomicAdd(out + k, (double)sh[k][0]);
 }
 
-__global__ void wgn_pass_a_kernel(WgnParams p, const float* stack, const float* X, const float* Jv, const float* Bv, const float* bD, const float* bB,
-                                  const float* z0, float* Y, float* q, float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
+__global__ void wgn_pass_a_kernel(WgnParams p, const float* stack, const float* X, const float* Iv, const float* Dv, const float* z0, float* Y, float* q,
+                                  float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
   __shared__ float sh[1][WGN_THREADS];
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   float vals[1] = {0.0f};
@@ -39,8 +39,7 @@ __global__ void wgn_pass_a_kernel(WgnParams p, const float* stack, const float* 
       q[k] = wgn_bilinear(stack + c * HW, p.W, u, v);
       qx[k] = wgn_bilinear(stack + (p.C + c) * HW, p.W, u, v);
       qy[k] = wgn_bilinear(stack + (2 * p.C + c) * HW, p.W, u, v);
-      float zm = p.transport ? Y[3 * i + 2] : z0[i];
-      wgn_model(Jv[k], Bv[k], bD[k], bB[k], zm, p.transport, &m[k], &dm[k]);
+      wgn_model(Iv[k], Dv[k], Y[3 * i + 2], z0[i], p.transport, &m[k], &dm[k]);
     }
     vals[0] = ok ? 1.0f : 0.0f;
   }
@@ -66,11 +65,11 @@ __global__ void wgn_pass_b_kernel(WgnParams p, const float* Y, const float* q, c
   wgn_block_add<WGN_NSUM>(sh, acc, hb);
 }
 
-void wgn_pass_a_cuda(const WgnParams& p, const float* stack, const float* X, const float* Jv, const float* Bv, const float* bD, const float* bB,
-                     const float* z0, float* Y, float* q, float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
+void wgn_pass_a_cuda(const WgnParams& p, const float* stack, const float* X, const float* Iv, const float* Dv, const float* z0, float* Y, float* q,
+                     float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
   int blocks = (p.N + WGN_THREADS - 1) / WGN_THREADS;
   if (blocks == 0) return;
-  wgn_pass_a_kernel<<<blocks, WGN_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(p, stack, X, Jv, Bv, bD, bB, z0, Y, q, qx, qy, m, dm, use, sums);
+  wgn_pass_a_kernel<<<blocks, WGN_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(p, stack, X, Iv, Dv, z0, Y, q, qx, qy, m, dm, use, sums);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

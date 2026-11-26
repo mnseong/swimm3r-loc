@@ -37,10 +37,9 @@ WGN_HD bool wgn_project(const WgnParams& p, const float* X, float* Y, float* u, 
   return z > 1e-6f && *u >= 1.0f && *u <= (float)p.W - 2.0f && *v >= 1.0f && *v <= (float)p.H - 2.0f;
 }
 
-WGN_HD void wgn_model(float J, float B, float bD, float bB, float z, int transport, float* m, float* dm) {
-  float tD = expf(-bD * z), tB = expf(-bB * z);
-  *m = J * tD + B * (1.0f - tB);
-  *dm = transport ? (-bD * J * tD + bB * B * tB) : 0.0f;
+WGN_HD void wgn_model(float I, float D, float z, float z0, int transport, float* m, float* dm) {
+  *m = transport ? I + D * (z - z0) : I;
+  *dm = transport ? D : 0.0f;
 }
 
 WGN_HD void wgn_row(const WgnParams& p, const float* Y, int c, float q, float qx, float qy, float g, float dm, float* row) {

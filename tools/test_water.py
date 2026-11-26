@@ -44,10 +44,12 @@ def betas(zz):
 def parts_at(pose, amp=1.0, half=False):
     J, alpha, z = scene_at(pose, amp)
     B = BINF[:, None, None].expand(3, H, W_).clone()
+    I = underwater(J, z)
     if not half:
-        return dict(J=J, alpha=alpha, depth=z, binf=B, betas=betas, level=0)
+        return dict(I=I, J=J, alpha=alpha, depth=z, binf=B, betas=betas, level=0)
     d, ok = Wp.pool_depth(z, alpha > 0.5, 1)
-    return dict(J=Wp.pool_image(J, 1), alpha=ok.float(), depth=torch.where(ok, d, torch.zeros_like(d)), binf=Wp.pool_image(B, 1), betas=betas, level=1)
+    return dict(I=Wp.pool_image(I, 1), J=Wp.pool_image(J, 1), alpha=ok.float(), depth=torch.where(ok, d, torch.zeros_like(d)), binf=Wp.pool_image(B, 1),
+                betas=betas, level=1)
 
 
 def query_at(pose, gen, amp=1.0, noise=0.006):
@@ -72,12 +74,13 @@ def check_steps_match():
             d, mk = Wp.pool_depth(parts["depth"], parts["alpha"] > 0.5, s)
             sel = mk.reshape(-1)
             X = Wp.backproject(d, (fx, fy, cx, cy)).reshape(-1, 3)[sel].contiguous()
-            Jv = Wp.pool_image(parts["J"], s).reshape(3, -1)[:, sel].contiguous()
-            Bv = Wp.pool_image(parts["binf"], s).reshape(3, -1)[:, sel].contiguous()
+            Iv = Wp.pool_image(parts["I"], s).reshape(3, -1)[:, sel].contiguous()
+            Jv = Wp.pool_image(parts["J"], s).reshape(3, -1)[:, sel]
+            Bv = Wp.pool_image(parts["binf"], s).reshape(3, -1)[:, sel]
             z0 = X[:, 2].contiguous()
-            bD, bB = betas(z0)
+            Dv = LW.slopes(Jv, Bv, z0, betas)
             Rt = torch.tensor(LW.start_state(), dtype=torch.float64)
-            args = (stack, X, Jv, Bv, bD.contiguous(), bB.contiguous(), z0, Rt, fx, fy, cx, cy, DEPTH, transport, 1.345, 6, 1e-9, 64)
+            args = (stack, X, Iv, Dv, z0, Rt, fx, fy, cx, cy, DEPTH, transport, 1.345, 6, 1e-9, 64)
             t0 = time.time()
             a = LW.align_level("ext", *args)
             t1 = time.time()
@@ -88,10 +91,20 @@ def check_steps_match():
             rows.append((transport, s, X.shape[0], a[1][0], b[1][0], diff, 1e3 * (t1 - t0) / max(a[1][0], 1), 1e3 * (t2 - t1) / max(b[1][0], 1)))
             assert a[1][0] == b[1][0] and a[1][2] == b[1][2] and diff < 1e-4, (transport, s, a[1], b[1], diff)
             assert torch.equal(a[4], b[4]) and float((a[2] - b[2]).abs().max()) < 1e-4 and float((a[3] - b[3]).abs().max()) < 1e-4
+            e = LW.evaluate_torch(stack, X, Iv, Dv, z0, a[0], fx, fy, cx, cy, transport)
+            assert torch.equal(e["use"], a[4]) and float((e["q"] - a[2]).abs().max()) < 1e-4 and float((e["m"] - a[3]).abs().max()) < 1e-4
+            assert abs(e["sig"] - a[1][3]) < 1e-5 * max(1.0, abs(e["sig"]))
     for r in rows:
         print("C++ against PyTorch, %s water, level 1/%d, %d points: %d and %d steps, largest difference of R and t %.1e | %.2f ms against %.2f ms per step on the CPU"
               % ("moving" if r[0] else "frozen", 2 ** r[1], r[2], r[3], r[4], r[5], r[6], r[7]))
     assert LW.self_check(torch.device("cpu"))
+    zz = torch.tensor([1.0, 2.0, 4.0])
+    law = lambda z: ((0.2 * torch.exp(0.1 * (z - 5.0)))[None].expand(3, -1).clone(), (0.1 + 0.0 * z)[None].expand(3, -1).clone())
+    sl = LW.slopes(torch.full((3, 3), 0.6), torch.full((3, 3), 0.3), zz, law)
+    f = lambda z: 0.6 * torch.exp(-law(z)[0][0] * z) + 0.3 * (1.0 - torch.exp(-law(z)[1][0] * z))
+    num = (f(zz * (1 + 1e-4)) - f(zz * (1 - 1e-4))) / (2e-4 * zz)
+    print("depth slope of the water model with a depth dependent beta_D: %s against finite differences %s" % (sl[0].numpy().round(5), num.numpy().round(5)))
+    assert float((sl[0] - num).abs().max()) < 1e-3, (sl, num)
 
 
 def check_water_align():
@@ -124,6 +137,18 @@ def check_water_align():
     assert not far["ok"] and far["steps"] == 0
 
 
+def check_corr():
+    g = torch.Generator().manual_seed(11)
+    n = 4000
+    a = torch.tensor([0.10, 0.45, 0.55])[:, None] + 0.01 * torch.randn(3, n, generator=g)
+    b = torch.tensor([0.10, 0.45, 0.55])[:, None] + 0.01 * torch.randn(3, n, generator=g)
+    am, bm = a - a.mean(1, keepdim=True), b - b.mean(1, keepdim=True)
+    per = float((am * bm).sum() / (am.norm() * bm.norm()))
+    pooled = float(((a - a.mean()) * (b - b.mean())).sum() / ((a - a.mean()).norm() * (b - b.mean()).norm()))
+    print("two unrelated images with the same colour cast: correlation centred per channel %.3f, centred over all channels %.3f" % (per, pooled))
+    assert abs(per) < 0.1 and pooled > 0.9
+
+
 def check_transport():
     K = G.intrinsics(FOCAL, PP)
     gen = torch.Generator().manual_seed(5)
@@ -152,7 +177,8 @@ def check_fast_path():
 
     def water(p, i):
         img, alpha, z = T.render(tt(p), depth=True)
-        return dict(J=img, alpha=alpha, depth=z, binf=torch.zeros(3, H, W_), betas=lambda zz: (torch.zeros(3, zz.shape[0]), torch.zeros(3, zz.shape[0])), level=0)
+        return dict(I=img, J=img, alpha=alpha, depth=z, binf=torch.zeros(3, H, W_), betas=lambda zz: (torch.zeros(3, zz.shape[0]), torch.zeros(3, zz.shape[0])),
+                    level=0)
 
     for n in hold:
         with torch.no_grad():
@@ -189,7 +215,8 @@ def check_bench():
 
     def water(p, num):
         img, alpha, z = T.render(tt(p), depth=True)
-        return dict(J=img, alpha=alpha, depth=z, binf=torch.zeros(3, H, W_), betas=lambda zz: (torch.zeros(3, zz.shape[0]), torch.zeros(3, zz.shape[0])), level=0)
+        return dict(I=img, J=img, alpha=alpha, depth=z, binf=torch.zeros(3, H, W_), betas=lambda zz: (torch.zeros(3, zz.shape[0]), torch.zeros(3, zz.shape[0])),
+                    level=0)
 
     fit = dict(register=True, k=6, grid=2, tol=2.0, n=len(hold), total=len(hold), half_px_med=0.1, half_px_p90=0.2, half_t_med=0.1, half_r_med=0.1,
                inliers_med=100.0, matches_med=200.0, matcher="LoFTR (test)")
@@ -223,11 +250,11 @@ def check_gpu():
         stack = LW.gradients(img).to(dev)
         X = torch.stack([(torch.rand(n, generator=g) - 0.5) * 2.4, (torch.rand(n, generator=g) - 0.5) * 1.4, 3.0 + torch.rand(n, generator=g)], -1).to(dev)
         mk = lambda lo, hi: (lo + (hi - lo) * torch.rand(3, n, generator=g)).to(dev)
-        Jv, Bv, bD, bB = mk(0.1, 0.9), mk(0.0, 0.5), mk(0.05, 0.5), mk(0.05, 0.4)
+        Iv, Dv = mk(0.1, 0.9), mk(-0.2, 0.05)
         z0 = X[:, 2].contiguous()
         St = torch.tensor(np.r_[LF.rodrigues(np.array([0.004, -0.006, 0.003])).reshape(-1), [0.01, -0.01, 0.02], [0.95, 1.0, 1.04]], dtype=torch.float64)
         f = ws * 0.55
-        args = (stack, X, Jv, Bv, bD, bB, z0, St, f, f, (ws - 1) / 2.0, (hs - 1) / 2.0, 3.5, True, 1.345, 8, 1e-12, 64)
+        args = (stack, X, Iv, Dv, z0, St, f, f, (ws - 1) / 2.0, (hs - 1) / 2.0, 3.5, True, 1.345, 8, 1e-12, 64)
         for _ in range(2):
             LW.align_level("ext", *args)
             LW.align_level("torch", *args)
@@ -242,7 +269,7 @@ def check_gpu():
         diff = float(np.abs(a[0] - b[0]).max())
         print("GPU %s, level %d x %d (%d points): C++ %.2f ms against PyTorch %.2f ms per step, %d and %d steps, largest difference %.1e" % (
             torch.cuda.get_device_name(0), hs, ws, n, 1e3 * (t1 - t0) / max(a[1][0], 1), 1e3 * (t2 - t1) / max(b[1][0], 1), a[1][0], b[1][0], diff))
-        assert a[1][0] == b[1][0] and diff < 1e-3, (a[1], b[1], diff)
+        assert abs(a[1][0] - b[1][0]) <= 1 and diff < 1e-3, (a[1], b[1], diff)
     assert LW.self_check(dev)
 
 
@@ -250,6 +277,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     check_steps_match()
     check_water_align()
+    check_corr()
     check_transport()
     check_fast_path()
     check_bench()

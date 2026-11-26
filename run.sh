@@ -22,7 +22,7 @@ esac
 export PYTHONPATH="$D/ubs/submodules:${PYTHONPATH:-}"
 mkdir -p "$D/.cache/torch" "$D/.cache/tmp" "$D/.cache/mpl"
 export TORCH_HOME="$D/.cache/torch" TMPDIR="$D/.cache/tmp" MPLCONFIGDIR="$D/.cache/mpl"
-if ! python -c "import sys; sys.path.insert(0, '$D/tools/csrc'); import torch, water_gn_ext" 2>/dev/null; then
+if ! python -c "import sys; sys.path.insert(0, '$D/tools/csrc'); import torch, water_gn_ext as w; assert w.has_cuda() or not torch.cuda.is_available()" 2>/dev/null; then
   command -v nvcc >/dev/null || export PATH="/usr/local/cuda/bin:$PATH"
   echo "building the C++ steps of the water aligned localization (tools/csrc), once"
   (cd "$D/tools/csrc" && rm -rf build && python setup.py build_ext --inplace > "$D/.cache/water_gn_build.log" 2>&1) \

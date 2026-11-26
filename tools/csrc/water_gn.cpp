@@ -6,14 +6,14 @@
 #include "water_gn.h"
 
 #ifdef WITH_CUDA
-void wgn_pass_a_cuda(const WgnParams& p, const float* stack, const float* X, const float* Jv, const float* Bv, const float* bD, const float* bB,
-                     const float* z0, float* Y, float* q, float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums);
+void wgn_pass_a_cuda(const WgnParams& p, const float* stack, const float* X, const float* Iv, const float* Dv, const float* z0, float* Y, float* q,
+                     float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums);
 void wgn_pass_b_cuda(const WgnParams& p, const float* Y, const float* q, const float* qx, const float* qy, const float* m, const float* dm,
                      const unsigned char* use, const float* g, const float* sig, float huber_k, double* hb);
 #endif
 
-static void pass_a_cpu(const WgnParams& p, const float* stack, const float* X, const float* Jv, const float* Bv, const float* bD, const float* bB,
-                       const float* z0, float* Y, float* q, float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
+static void pass_a_cpu(const WgnParams& p, const float* stack, const float* X, const float* Iv, const float* Dv, const float* z0, float* Y, float* q,
+                       float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
   const int C = p.C, N = p.N;
   const long HW = (long)p.H * p.W;
   for (int i = 0; i < N; ++i) {
@@ -29,8 +29,7 @@ static void pass_a_cpu(const WgnParams& p, const float* stack, const float* X, c
       q[k] = wgn_bilinear(stack + c * HW, p.W, u, v);
       qx[k] = wgn_bilinear(stack + (C + c) * HW, p.W, u, v);
       qy[k] = wgn_bilinear(stack + (2 * C + c) * HW, p.W, u, v);
-      float zm = p.transport ? Y[3 * i + 2] : z0[i];
-      wgn_model(Jv[k], Bv[k], bD[k], bB[k], zm, p.transport, &m[k], &dm[k]);
+      wgn_model(Iv[k], Dv[k], Y[3 * i + 2], z0[i], p.transport, &m[k], &dm[k]);
     }
     if (ok) sums[0] += 1.0;
   }
@@ -107,9 +106,18 @@ static bool solve_normal(const double* hb, double* x) {
   return true;
 }
 
-std::vector<torch::Tensor> align_level(torch::Tensor stack, torch::Tensor X, torch::Tensor Jv, torch::Tensor Bv, torch::Tensor bD, torch::Tensor bB,
-                                       torch::Tensor z0, torch::Tensor Rt, double fx, double fy, double cx, double cy, double scale, bool transport,
-                                       double huber_k, int64_t iters, double tol, int64_t min_use) {
+static torch::Tensor mad_scale(const torch::Tensor& r) {
+  auto rf = r.reshape({-1});
+  int64_t n = rf.numel();
+  int64_t stride = std::max<int64_t>(1, (n + 16383) / 16384);
+  auto rs = rf.slice(0, 0, n, stride);
+  auto med = rs.nanmedian();
+  return (1.4826 * (rs - med).abs().nanmedian() + 1e-6).to(torch::kFloat32).reshape({1}).contiguous();
+}
+
+std::vector<torch::Tensor> align_level(torch::Tensor stack, torch::Tensor X, torch::Tensor Iv, torch::Tensor Dv, torch::Tensor z0, torch::Tensor St,
+                                       double fx, double fy, double cx, double cy, double scale, bool transport, double huber_k, int64_t iters,
+                                       double tol, int64_t min_use) {
   TORCH_CHECK(stack.dim() == 3 && stack.size(0) % 3 == 0, "stack must be (3C, H, W)");
   TORCH_CHECK(stack.scalar_type() == torch::kFloat32 && X.scalar_type() == torch::kFloat32, "float32 tensors expected");
   TORCH_CHECK(stack.size(0) / 3 <= 3, "at most 3 colour channels");
@@ -119,10 +127,8 @@ std::vector<torch::Tensor> align_level(torch::Tensor stack, torch::Tensor X, tor
 #endif
   stack = stack.contiguous();
   X = X.contiguous();
-  Jv = Jv.contiguous();
-  Bv = Bv.contiguous();
-  bD = bD.contiguous();
-  bB = bB.contiguous();
+  Iv = Iv.contiguous();
+  Dv = Dv.contiguous();
   z0 = z0.contiguous();
   WgnParams p;
   p.C = (int)(stack.size(0) / 3);
@@ -142,81 +148,102 @@ std::vector<torch::Tensor> align_level(torch::Tensor stack, torch::Tensor X, tor
   auto use = torch::zeros({p.N}, fo.dtype(torch::kUInt8));
   auto sums = torch::zeros({1}, fo.dtype(torch::kFloat64));
   auto hb = torch::zeros({WGN_NSUM}, fo.dtype(torch::kFloat64));
-  auto rt = Rt.to(torch::kCPU, torch::kFloat64).contiguous();
-  double R[9], t[3];
-  TORCH_CHECK(rt.numel() == 15, "state must hold R (9), t (3) and the gains (3)");
-  double gh[3];
-  for (int i = 0; i < 9; ++i) R[i] = rt.data_ptr<double>()[i];
-  for (int i = 0; i < 3; ++i) t[i] = rt.data_ptr<double>()[9 + i];
-  for (int i = 0; i < 3; ++i) gh[i] = rt.data_ptr<double>()[12 + i];
+  auto st = St.to(torch::kCPU, torch::kFloat64).contiguous();
+  TORCH_CHECK(st.numel() == 15, "state must hold R (9), t (3) and the gains (3)");
+  double S[15], best[15];
+  for (int i = 0; i < 15; ++i) S[i] = best[i] = st.data_ptr<double>()[i];
   int steps = 0, n_use = 0;
-  double last = -1.0;
-
-  for (int64_t it = 0; it < iters; ++it) {
-    for (int i = 0; i < 9; ++i) p.R[i] = (float)R[i];
-    for (int i = 0; i < 3; ++i) p.t[i] = (float)t[i];
+  double last = -1.0, best_sig = -1.0;
+  bool fresh = false;
+  auto evaluate = [&](const double* s, bool with_b, double* hbh, double* sig_out) {
+    for (int i = 0; i < 9; ++i) p.R[i] = (float)s[i];
+    for (int i = 0; i < 3; ++i) p.t[i] = (float)s[9 + i];
     sums.zero_();
     hb.zero_();
     if (cuda) {
 #ifdef WITH_CUDA
-      wgn_pass_a_cuda(p, stack.data_ptr<float>(), X.data_ptr<float>(), Jv.data_ptr<float>(), Bv.data_ptr<float>(), bD.data_ptr<float>(),
-                      bB.data_ptr<float>(), z0.data_ptr<float>(), Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(),
-                      m.data_ptr<float>(), dm.data_ptr<float>(), use.data_ptr<unsigned char>(), sums.data_ptr<double>());
+      wgn_pass_a_cuda(p, stack.data_ptr<float>(), X.data_ptr<float>(), Iv.data_ptr<float>(), Dv.data_ptr<float>(), z0.data_ptr<float>(),
+                      Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(), dm.data_ptr<float>(),
+                      use.data_ptr<unsigned char>(), sums.data_ptr<double>());
 #endif
     } else {
-      pass_a_cpu(p, stack.data_ptr<float>(), X.data_ptr<float>(), Jv.data_ptr<float>(), Bv.data_ptr<float>(), bD.data_ptr<float>(),
-                 bB.data_ptr<float>(), z0.data_ptr<float>(), Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(),
-                 m.data_ptr<float>(), dm.data_ptr<float>(), use.data_ptr<unsigned char>(), sums.data_ptr<double>());
+      pass_a_cpu(p, stack.data_ptr<float>(), X.data_ptr<float>(), Iv.data_ptr<float>(), Dv.data_ptr<float>(), z0.data_ptr<float>(), Y.data_ptr<float>(),
+                 q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(), dm.data_ptr<float>(), use.data_ptr<unsigned char>(),
+                 sums.data_ptr<double>());
     }
-    auto g = torch::tensor({(float)gh[0], (float)gh[1], (float)gh[2]}, torch::dtype(torch::kFloat32)).narrow(0, 0, p.C).to(stack.device()).contiguous();
+    auto g = torch::tensor({(float)s[12], (float)s[13], (float)s[14]}, torch::dtype(torch::kFloat32)).narrow(0, 0, p.C).to(stack.device()).contiguous();
     auto ub = use.to(torch::kBool).unsqueeze(0).expand({p.C, p.N});
     auto r = torch::where(ub, g.unsqueeze(1) * q - m, torch::full_like(q, NAN));
-    auto med = r.nanmedian();
-    auto sig = (1.4826 * (r - med).abs().nanmedian() + 1e-6).to(torch::kFloat32).reshape({1}).contiguous();
-    if (cuda) {
+    auto sig = mad_scale(r);
+    if (with_b) {
+      if (cuda) {
 #ifdef WITH_CUDA
-      wgn_pass_b_cuda(p, Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(),
-                      dm.data_ptr<float>(), use.data_ptr<unsigned char>(), g.data_ptr<float>(), sig.data_ptr<float>(), (float)huber_k,
-                      hb.data_ptr<double>());
+        wgn_pass_b_cuda(p, Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(),
+                        dm.data_ptr<float>(), use.data_ptr<unsigned char>(), g.data_ptr<float>(), sig.data_ptr<float>(), (float)huber_k,
+                        hb.data_ptr<double>());
 #endif
-    } else {
-      pass_b_cpu(p, Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(), dm.data_ptr<float>(),
-                 use.data_ptr<unsigned char>(), g.data_ptr<float>(), sig.data_ptr<float>(), (float)huber_k, hb.data_ptr<double>());
+      } else {
+        pass_b_cpu(p, Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(), dm.data_ptr<float>(),
+                   use.data_ptr<unsigned char>(), g.data_ptr<float>(), sig.data_ptr<float>(), (float)huber_k, hb.data_ptr<double>());
+      }
     }
-    auto both = torch::cat({hb, sums}).to(torch::kCPU);
-    const double* hbh = both.data_ptr<double>();
-    n_use = (int)hbh[WGN_NSUM];
+    auto both = torch::cat({hb, sums, sig.to(torch::kFloat64)}).to(torch::kCPU);
+    const double* h = both.data_ptr<double>();
+    for (int k = 0; k < WGN_NSUM; ++k) hbh[k] = h[k];
+    *sig_out = h[WGN_NSUM + 1];
+    return (int)h[WGN_NSUM];
+  };
+  double hbh[WGN_NSUM], sig = 0.0;
+  for (int64_t it = 0; it < iters; ++it) {
+    n_use = evaluate(S, true, hbh, &sig);
+    fresh = true;
     if (n_use < min_use) break;
+    if (best_sig >= 0.0 && sig > best_sig * 1.02) {
+      for (int i = 0; i < 15; ++i) S[i] = best[i];
+      --steps;
+      fresh = false;
+      break;
+    }
+    best_sig = sig;
+    for (int i = 0; i < 15; ++i) best[i] = S[i];
     double xi[WGN_P];
     if (!solve_normal(hbh, xi)) break;
-    for (int c = 0; c < p.C; ++c) {
-      double gn = gh[c] + xi[6 + c];
-      gh[c] = gn < 0.25 ? 0.25 : (gn > 4.0 ? 4.0 : gn);
-    }
     double Rw[9];
     rodrigues(xi + 3, Rw);
     double Rn[9], tn[3];
     for (int i = 0; i < 3; ++i) {
       for (int j = 0; j < 3; ++j) {
-        double s = 0.0;
-        for (int l = 0; l < 3; ++l) s += Rw[3 * i + l] * R[3 * l + j];
-        Rn[3 * i + j] = s;
+        double s2 = 0.0;
+        for (int l = 0; l < 3; ++l) s2 += Rw[3 * i + l] * S[3 * l + j];
+        Rn[3 * i + j] = s2;
       }
-      tn[i] = Rw[3 * i] * t[0] + Rw[3 * i + 1] * t[1] + Rw[3 * i + 2] * t[2] + scale * xi[i];
+      tn[i] = Rw[3 * i] * S[9] + Rw[3 * i + 1] * S[10] + Rw[3 * i + 2] * S[11] + scale * xi[i];
     }
-    for (int i = 0; i < 9; ++i) R[i] = Rn[i];
-    for (int i = 0; i < 3; ++i) t[i] = tn[i];
+    for (int i = 0; i < 9; ++i) S[i] = Rn[i];
+    for (int i = 0; i < 3; ++i) S[9 + i] = tn[i];
+    for (int c = 0; c < p.C; ++c) {
+      double gn = S[12 + c] + xi[6 + c];
+      S[12 + c] = gn < 0.25 ? 0.25 : (gn > 4.0 ? 4.0 : gn);
+    }
+    fresh = false;
     ++steps;
     double nt = std::sqrt(xi[0] * xi[0] + xi[1] * xi[1] + xi[2] * xi[2]);
     double nr = std::sqrt(xi[3] * xi[3] + xi[4] * xi[4] + xi[5] * xi[5]);
     last = nt > nr ? nt : nr;
     if (last < tol) break;
   }
+  if (!fresh) {
+    n_use = evaluate(S, false, hbh, &sig);
+    if (best_sig >= 0.0 && (n_use < min_use || sig > best_sig * 1.02)) {
+      for (int i = 0; i < 15; ++i) S[i] = best[i];
+      --steps;
+      n_use = evaluate(S, false, hbh, &sig);
+    }
+  }
+  if (steps < 0) steps = 0;
   auto out = torch::zeros({15}, torch::dtype(torch::kFloat64));
-  for (int i = 0; i < 9; ++i) out.data_ptr<double>()[i] = R[i];
-  for (int i = 0; i < 3; ++i) out.data_ptr<double>()[9 + i] = t[i];
-  for (int i = 0; i < 3; ++i) out.data_ptr<double>()[12 + i] = gh[i];
-  auto info = torch::tensor({(double)steps, last, (double)n_use}, torch::dtype(torch::kFloat64));
+  for (int i = 0; i < 15; ++i) out.data_ptr<double>()[i] = S[i];
+  auto info = torch::tensor({(double)steps, last, (double)n_use, sig}, torch::dtype(torch::kFloat64));
   return {out, info, q, m, use};
 }
 
