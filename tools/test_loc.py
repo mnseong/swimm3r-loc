@@ -15,6 +15,7 @@ import bench_proto as P
 import eval_gaussian_map as E
 import loc_ff
 import loc_geom as G
+import loc_ref as R
 import loc_warp as Wp
 
 H, W_, FOCAL, DEPTH = 128, 192, 180.0, 4.0
@@ -258,11 +259,73 @@ def check_gscpe():
     assert "lpips" not in short["rows"][1] and "%%" not in short_text
 
 
+def check_register():
+    dev = torch.device("cpu")
+    tt = lambda p: torch.tensor(np.asarray(p), dtype=torch.float32)
+    nums = list(range(2, 41))
+    hold = [n for k, n in enumerate(nums) if 4 <= k % 12 <= 6]
+    mapf = [n for n in nums if n not in hold]
+    name = lambda i: "%06d.jpg" % i
+    truth = {i: true_pose(i) for i in nums}
+    with torch.no_grad():
+        imgs = torch.stack([render(tt(truth[i])) for i in mapf])
+        depth = torch.stack([surface_points(tt(truth[i]))[1] for i in mapf])
+    c2w = torch.stack([tt(truth[i]) for i in mapf])
+    intr = torch.tensor([[FOCAL, 0.0, PP[0] - 0.5], [0.0, FOCAL, PP[1] - 0.5], [0.0, 0.0, 1.0]]).expand(len(mapf), 3, 3).contiguous()
+    net = StandIn()
+    loc = loc_ff.Localizer(net, loc_ff.encode_frames(net, imgs), depth, torch.full_like(depth, 2.0), intr, c2w, FOCAL, PP, 1.0, dev, subsample=4, reproj=2.5)
+    before = (loc.poses.copy(), loc.xyz.clone(), loc.K.copy())
+    gen = torch.Generator().manual_seed(6)
+
+    def load(nm):
+        with torch.no_grad():
+            return (render(tt(truth[E.fnum(nm)])) + 0.004 * torch.randn(3, H, W_, generator=gen)).clamp(0.0, 1.0)
+
+    tests = [name(i) for i in hold]
+    poses_np = c2w.numpy().astype(np.float64)
+    interp = E.interpolate_poses(poses_np, hold, mapf)
+    poses, fit, rows = R.register_queries(loc, tests, load, mapf, interp, k=6, tol=1.5, verbose=False)
+    assert loc.subsample == 4 and float(np.abs(loc.poses - before[0]).max()) == 0.0 and bool((loc.xyz == before[1]).all()) and float(np.abs(loc.K - before[2]).max()) == 0.0
+    assert all(len(r["frames"]) == 6 and min(r["frames"]) < r["frame"] < max(r["frames"]) and r["frame"] not in r["frames"] for r in rows), rows[0]
+    pts = surface_points(tt(truth[hold[4]]))[0].reshape(-1, 3)[::37].double().numpy()
+    err = np.array([list(G.pose_error(poses[n], truth[E.fnum(n)], DEPTH)) + [G.pixel_shift(loc.K, truth[E.fnum(n)], poses[n], pts, (H, W_))] for n in poses])
+    start = np.array([G.pixel_shift(loc.K, truth[h], interp[k], pts, (H, W_)) for k, h in enumerate(hold)])
+    print("queries registered into the fixed map: %d of %d with a reference, against the true poses a median of %.3f %% of depth, %.3f deg, %.3f px "
+          "(the interpolated start is %.1f px off); earlier and later map frames alone differ by a median of %.2f px" % (
+              fit["n"], fit["total"], np.median(err[:, 0]), np.median(err[:, 1]), np.nanmedian(err[:, 2]), np.nanmedian(start), fit["half_px_med"]))
+    assert fit["register"] and fit["n"] >= 7 and fit["total"] == 9 and fit["grid"] == 2, fit
+    assert np.median(err[:, 0]) < 0.5 and np.median(err[:, 1]) < 0.3 and np.nanmedian(err[:, 2]) < 0.6 and np.nanmax(err[:, 2]) < 2.0, err
+    lines = R.reference_lines(fit, skipped=fit["total"] - fit["n"])
+    assert "registered into the fixed map" in lines[0] and "%%" not in "\n".join(lines)
+    far, fit_far, _ = R.register_queries(loc, tests[:2], load, mapf, interp[:2], k=6, tol=1e-6, verbose=False)
+    assert not far and fit_far["n"] == 0
+    out_dir = tempfile.mkdtemp()
+
+    def strict(pose, med=None, t=None, alpha=False, which="underwater", depth=False):
+        assert which == "restored" or med is not None
+        return render(pose, med, t, alpha, which, depth)
+
+    def score(img, gt):
+        mae = float((img.clamp(0, 1) - gt).abs().mean())
+        return [float(-10.0 * torch.log10(((img.clamp(0, 1) - gt) ** 2).mean() + 1e-12)), 1.0 - mae, mae]
+
+    res = C.run(dict(dev=dev, tests=tests, fps=5.0, warmup=1, map_nums=mapf, load=load, medium=lambda num, pose: {}, render=strict, score=score, loc=loc,
+                     loc_public=None, out_dir=out_dir, ref_poses=poses, ref_fit=fit, ref_source="registration", ablation=False))
+    text = C.report(res, dict(scene="synthetic scene", map_frames=len(mapf), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in", mapping_seconds=None,
+                              weights_mb={"none": 0.0}, reference="every query registered into the fixed map", split="test : train = 1 : 3.3"))
+    print(text[text.index(" Reference"):text.index(" Pipeline")])
+    assert res["frames"] == fit["n"] and res["skipped"] == 9 - fit["n"] and "registered into the fixed map" in text and "Check       render of the map" in text
+    assert res["reference_check"]["n"] == fit["n"] and res["reference_check"]["lpips"] < 0.01 and "%%" not in text, res["reference_check"]
+    row = next(r for r in res["rows"] if r["label"] == "coarse: render, match, PnP")
+    assert row["acc"][1] == 100.0 and row["px"] < 1.0, row
+
+
 def main():
     torch.manual_seed(0)
     check_geometry()
     check_pose_files()
     check_warp()
+    check_register()
     check_gscpe()
     dev = torch.device("cpu")
     nums = list(range(2, 41))

@@ -11,6 +11,7 @@ import bench_loc as B
 import bench_proto as P
 import eval_gaussian_map as E
 import loc_geom as G
+import loc_ref as R
 import loc_warp as Wp
 
 THRESHOLDS = ((10.0, 5.0), (5.0, 5.0), (2.0, 2.0), (1.0, 1.0))
@@ -32,6 +33,9 @@ def summary(rows, warm, depth_m=None):
         v = [r["ev"][k] for r in rows if k in r["ev"]]
         if v:
             out[k] = float(np.mean(v))
+    fl = [r["ev"]["flow"] for r in rows if r["ev"].get("flow") is not None and np.isfinite(r["ev"]["flow"])]
+    if fl:
+        out["flow"] = float(np.median(fl))
     s = np.array([r["sec"] for r in rows[min(warm, max(len(rows) - 1, 0)):] if r.get("sec") is not None], dtype=np.float64)
     if len(s):
         out.update(s_mean=float(s.mean()), s_med=float(np.median(s)), s_p90=float(np.percentile(s, 90)), fps=float(1.0 / max(s.mean(), 1e-9)))
@@ -86,15 +90,33 @@ def run(ctx):
         seen = max(G.covisible(loc.K, p, loc.poses[k], loc.points[near], hw) for k in loc.near(p, 6))
         ref.append(dict(pose=p, near=near, points=loc.points[near], gap_t=100.0 * dt / scale, gap_r=dr, seen=float(seen)))
 
+    def flow_of(j, img, alpha):
+        return G.flow_residual(imgs[j].permute(1, 2, 0).cpu().numpy(), img.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy(), (alpha > 0.5).cpu().numpy())
+
     def evaluate(j, pose, num):
         dt, dr = G.motion(pose, ref[j]["pose"])
         out = dict(t=100.0 * dt / scale, r=dr, px=G.pixel_shift(loc.K, ref[j]["pose"], pose, ref[j]["points"], hw))
         if ctx.get("score") is not None:
             pt = tens(pose)
             with torch.no_grad():
-                sc = ctx["score"](ctx["render"](pt, ctx["medium"](num, pt), t=num / fps), imgs[j])
-            out.update(psnr=sc[0], ssim=sc[1], lpips=sc[2])
+                img, alpha = ctx["render"](pt, ctx["medium"](num, pt), t=num / fps, alpha=True)
+                sc = ctx["score"](img, imgs[j])
+            out.update(psnr=sc[0], ssim=sc[1], lpips=sc[2], flow=flow_of(j, img, alpha))
         return out
+
+    def check_reference():
+        fl, sc = [], []
+        for j in range(len(tests)):
+            num = E.fnum(tests[j])
+            pt = tens(ref[j]["pose"])
+            with torch.no_grad():
+                img, alpha = ctx["render"](pt, ctx["medium"](num, pt), t=num / fps, alpha=True)
+                if ctx.get("score") is not None:
+                    sc.append(ctx["score"](img, imgs[j]))
+            fl.append(flow_of(j, img, alpha))
+        fl = [x for x in fl if x is not None and np.isfinite(x)]
+        return dict(n=len(tests), flow=float(np.median(fl)) if fl else None, lpips=float(np.mean([x[2] for x in sc])) if sc else None,
+                    psnr=float(np.mean([x[0] for x in sc])) if sc else None)
 
     def coarse(fq, p0, num, which, lz=loc):
         T = np.asarray(p0, dtype=np.float64)
@@ -188,6 +210,10 @@ def run(ctx):
         warp(j0, c0["pose"], map_nums[i0[0]], "underwater")
         print("[gscpe] first query: %d inliers of %d matches after %d passes" % (c0["inliers"], c0["matches"], c0["iters"]), flush=True)
 
+    try:
+        res["reference_check"] = check_reference() if tests else None
+    except Exception as e:
+        res["notes"].append("check of the reference failed: %s: %s" % (type(e).__name__, e))
     res["difficulty"] = dict(t=float(np.median([r["gap_t"] for r in ref])) if ref else None, r=float(np.median([r["gap_r"] for r in ref])) if ref else None,
                              t_max=float(np.max([r["gap_t"] for r in ref])) if ref else None, r_max=float(np.max([r["gap_r"] for r in ref])) if ref else None,
                              seen=float(np.median([r["seen"] for r in ref])) if ref else None)
@@ -275,14 +301,14 @@ def fmt(v, spec):
 
 
 def table(rows, key_t, key_acc, unit):
-    head = "   %-38s %6s %6s %6s %6s | %8s %7s %6s | %6s %6s %6s | %7s %7s %6s %7s" % (
-        "method", "10/5", "5/5", "2/2", "1/1", "t " + unit, "rot deg", "px", "LPIPS", "SSIM", "PSNR", "s mean", "s med", "FPS", "J")
+    head = "   %-38s %6s %6s %6s %6s | %8s %7s %6s %5s | %6s %6s %6s | %7s %7s %6s %7s" % (
+        "method", "10/5", "5/5", "2/2", "1/1", "t " + unit, "rot deg", "px", "flow", "LPIPS", "SSIM", "PSNR", "s mean", "s med", "FPS", "J")
     out = [head]
     for r in rows:
         if r.get(key_acc) is None:
             continue
-        out.append("   %-38s %6.1f %6.1f %6.1f %6.1f | %8.3f %7.3f %6s | %6s %6s %6s | %7s %7s %6s %7s" % (
-            r["label"], r[key_acc][0], r[key_acc][1], r[key_acc][2], r[key_acc][3], r[key_t], r["r"], fmt(r.get("px"), "%.2f"),
+        out.append("   %-38s %6.1f %6.1f %6.1f %6.1f | %8.3f %7.3f %6s %5s | %6s %6s %6s | %7s %7s %6s %7s" % (
+            r["label"], r[key_acc][0], r[key_acc][1], r[key_acc][2], r[key_acc][3], r[key_t], r["r"], fmt(r.get("px"), "%.2f"), fmt(r.get("flow"), "%.1f"),
             fmt(r.get("lpips"), "%.3f"), fmt(r.get("ssim"), "%.3f"), fmt(r.get("psnr"), "%.2f"), fmt(r.get("s_mean"), "%.3f"),
             fmt(r.get("s_med"), "%.3f"), fmt(r.get("fps"), "%.2f"), fmt(r.get("joule"), "%.1f")))
     return out
@@ -306,18 +332,11 @@ def report(res, info):
         L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization%s" % (
             info["mapping_seconds"], mf, info["mapping_seconds"] / mf,
             "; the poses of the queries come from this same reconstruction" if mf != info["map_frames"] else ""))
-    f = res.get("fit") or {}
-    L += ["-" * W, " Reference   %s" % (info.get("reference") or "poses of a reconstruction of all frames, the queries included")]
-    if f.get("same"):
-        L.append("             same frame and intrinsics as the map, nothing moved between reconstructions (focal of the map frames %.2f, of the queries %.2f).%s" % (
-            f.get("focal_map", float("nan")), f.get("focal_queries", float("nan")),
-            " %d queries without a reference pose are left out." % res["skipped"] if res.get("skipped") else ""))
-    else:
-        L += ["             moved into the map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ by a median of" % (
-                  f.get("n", 0), f.get("scale", float("nan"))),
-              "             %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), the floor of every pose error below.%s" % (
-                  f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")),
-                  " %d queries without a reference pose are left out." % res["skipped"] if res.get("skipped") else "")]
+    L += ["-" * W] + R.reference_lines(res.get("fit"), info.get("reference"), res.get("skipped"))
+    rc = res.get("reference_check") or {}
+    if rc.get("n"):
+        L.append(" Check       render of the map at the reference poses against the queries, no estimate involved: optical flow median %s px, LPIPS %s, PSNR %s (%d queries)" % (
+            fmt(rc.get("flow"), "%.2f"), fmt(rc.get("lpips"), "%.3f"), fmt(rc.get("psnr"), "%.2f"), rc["n"]))
     df = res.get("difficulty") or {}
     if df.get("t") is not None:
         L.append(" Queries     a median of %.1f %% of depth and %.1f deg from the nearest map frame (largest %.1f %%, %.1f deg), the map frames near it see %.0f %% of the view" % (
@@ -357,8 +376,9 @@ def report(res, info):
         L.append("             system memory peak %d MB of %d MB (tegrastats, CPU and GPU share it)" % (m["system_ram_peak_mb"], m["system_ram_total_mb"]))
     L.append("             weights %s (the MASt3R base weights are not counted)" % " + ".join("%s %.1f MB" % (k, v) for k, v in info["weights_mb"].items()))
     L += ["-" * W,
-          " px: median shift of the map points in the image between the estimate and the reference. LPIPS, SSIM, PSNR: underwater render at the estimated pose",
-          " against the query. Time per query runs from the query on the GPU to the pose. Image loading and scoring are not timed. J: mean power of the pass",
+          " px: median shift of the map points in the image between the estimate and the reference. flow: median optical flow in px between the query and the",
+          " render at the estimated pose, no reference involved. LPIPS, SSIM, PSNR: underwater render at the estimated pose against the query. The reference",
+          " is made with the matcher of the map itself, so the rows that match with the same backbone are not independent of it. Time per query runs from the query on the GPU to the pose. Image loading and scoring are not timed. J: mean power of the pass",
           " (tegrastats) times the mean time per query. PnP threshold %.1f px, solver: %s. Matching grid every %d px." % (
               res["reproj_px"], res.get("solver", "none"), res["subsample"]),
           " Taken from the paper: test 1 to train 3 split with unseen queries, pose of the best retrieved frame as the start, render, match, lift by the rendered",

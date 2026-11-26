@@ -238,6 +238,11 @@ def main():
                          "--scene_dir is the Stage 1 output of all frames, the test_files of this split are left out of the Gaussian map, "
                          "the medium field and the store of map frames, and their own poses in that same reconstruction are the reference "
                          "of --gscpe and --proto (same frame and intrinsics, nothing moved between reconstructions)")
+    ap.add_argument("--ref_register", type=int, default=0, metavar="K",
+                    help="reference poses of --gscpe and --proto by registering every query into this map with the map fixed (the map is "
+                         "made from the map frames alone, the queries never entered Stage 1): matches to the K map frames nearest in time "
+                         "lifted by the points of the map, PnP with RANSAC and a refit on all matches; a reference counts when the "
+                         "registrations on the earlier and on the later map frames alone agree within --proto_ref_tol px (tools/loc_ref.py)")
     ap.add_argument("--proto_ref_poses", default=None,
                     help="--proto and --gscpe: reference poses of all frames from another reconstruction, a COLMAP model (folder, images.bin "
                          "or images.txt) or a json of name to camera to world 4 x 4, moved into this map like --proto_ref_scene")
@@ -908,7 +913,18 @@ def main():
         loc = loc_ff.Localizer(net, feat, depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev, subsample=args.loc_subsample,
                                reproj=args.loc_reproj)
         ref_poses, ref_fit, ref_text, ref_src = None, None, None, None
-        if held_ref is not None:
+        load_query = lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev)
+        if args.ref_register > 0 and held_ref is None:
+            import loc_ref
+            ref_poses, ref_fit, ref_rows = loc_ref.register_queries(
+                loc, tests, load_query, fnums, E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums), k=args.ref_register,
+                tol=args.proto_ref_tol)
+            ref_text = "every query registered into the fixed map"
+            ref_src = (None, None, "registration into the fixed map", ref_text)
+            json.dump(bench_proto.clean(dict(fit=ref_fit, queries=ref_rows, poses=ref_poses)), open(os.path.join(args.out_dir, "reference_register.json"), "w"), indent=1)
+            print("[ref] %d of %d queries have a reference: the registrations on the earlier and the later map frames differ by a median of %s px" % (
+                ref_fit["n"], ref_fit["total"], "-" if ref_fit["half_px_med"] is None else "%.2f" % ref_fit["half_px_med"]), flush=True)
+        elif held_ref is not None:
             ref_poses = {k: v for k, v in held_ref.items() if k in set(tests)}
             ref_fit = dict(same=True, n=int(held_info["map_frames"]), focal_map=held_info["focal_map"], focal_queries=held_info["focal_queries"])
             ref_text = ("poses of the queries in the same Stage 1 reconstruction of all frames as the map (as GS-CPE takes the COLMAP or SLAM poses "
@@ -924,7 +940,7 @@ def main():
             ref_src = ([os.path.basename(q) for q in rs.img_paths], rs.cam2w.detach().float().cpu().numpy(), args.proto_ref_scene,
                        "poses of an offline mapping of all frames by the same model (map frames and queries together), no external reconstruction")
             del rs
-        if ref_src is not None and held_ref is None:
+        if ref_src is not None and ref_src[0] is not None:
             got = loc_geom.transfer_poses(ref_src[0], ref_src[1], list(names), poses_np, tests)
             if got is None:
                 print("[proto] the reference shares fewer than 3 frames with this map, the reference is made on this map", flush=True)
@@ -949,7 +965,6 @@ def main():
         weights_mb = {"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}
         tail = (f"\nrender path {args.medium_raster}, veil fit {'on' if args.binf_veil else 'off'}, time windows "
                 f"{args.time_bucket if tmaps else 0} ({n_win} primitives), far layer {n_far} primitives")
-        load_query = lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev)
         if args.proto:
             quick = bool(args.proto_quick)
             res = bench_proto.run(dict(

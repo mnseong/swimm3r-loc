@@ -565,7 +565,10 @@ def report(res, info):
         L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization" % (
             info["mapping_seconds"], info["map_frames"], info["mapping_seconds"] / info["map_frames"]))
     r = res["reference"]
-    if r.get("given"):
+    if r.get("given") and ((r.get("fit") or {}).get("register") or (r.get("fit") or {}).get("same")):
+        import loc_ref
+        L += ["-" * W] + loc_ref.reference_lines(r.get("fit"), "poses of the queries in the Stage 1 reconstruction of all frames", r["frames"] - r["verified"])
+    elif r.get("given"):
         f = r.get("fit") or {}
         L += ["-" * W, " Reference   poses of an offline mapping of all frames (the map frames and the queries together), no external reconstruction,",
               "             moved into this map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ" % (
