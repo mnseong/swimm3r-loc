@@ -197,6 +197,23 @@ def main():
     ap.add_argument("--bench_render_reps", type=int, default=5)
     ap.add_argument("--bench_warmup", type=int, default=2)
     ap.add_argument("--bench_mapping_seconds", type=float, default=None)
+    ap.add_argument("--proto", action="store_true",
+                    help="efficient localization protocol in place of --bench (tools/bench_proto.py): reference poses by an offline "
+                         "registration, tracking with a causal start pose, relocalization without a start pose, convergence from "
+                         "known offsets, with feed forward matching and PnP (tools/loc_ff.py), render and compare, and both "
+                         "together; one table, saved as protocol.txt")
+    ap.add_argument("--proto_public", action="store_true", help="--proto: also the public MASt3R weights in the same pipeline on the same map")
+    ap.add_argument("--proto_quick", action="store_true", help="--proto: shorter runs (render and compare up to 100 steps, reference 100 and 200 steps)")
+    ap.add_argument("--proto_rc_steps", type=int, nargs="+", default=[10, 25, 50, 100, 300])
+    ap.add_argument("--proto_ff_steps", type=int, nargs="+", default=[5, 10, 25])
+    ap.add_argument("--proto_topk", type=int, nargs="+", default=[1, 3])
+    ap.add_argument("--proto_ref_steps", type=int, default=200)
+    ap.add_argument("--proto_ref_check", type=int, default=300)
+    ap.add_argument("--proto_ref_frames", type=int, default=6)
+    ap.add_argument("--proto_ref_tol", type=float, default=2.0, help="--proto: a reference pose counts when its two runs shift the map points by at most this many px")
+    ap.add_argument("--proto_px", type=float, default=2.0, help="--proto: a pose counts as registered when the map points shift by at most this many px")
+    ap.add_argument("--loc_subsample", type=int, default=8, help="--proto: grid of the matching in px")
+    ap.add_argument("--loc_reproj", type=float, default=None, help="--proto: PnP threshold in px (default 0.008 of the image diagonal)")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -715,7 +732,7 @@ def main():
               f"squared error uncovered | on the single view cover: fused {dmean['fused_on_single_cover']:.2f} single "
               f"{dmean['single_on_single_cover']:.2f} | medium of the nearest other frames {dmean['fused_nearest_other_medium']:.2f}", flush=True)
 
-    if args.data_dir and not args.bench:
+    if args.data_dir and not (args.bench or args.proto):
         split = json.load(open(os.path.join(args.data_dir, "split.json")))
         centre = set(E.fnum(x) for x in split.get("centre_files", []))
         tests = sorted(split["test_files"], key=E.fnum)
@@ -822,7 +839,43 @@ def main():
                         kf_c2w=c2w.cpu().numpy(), frame_c2w=c2w.cpu().numpy(), focal=np.float32(focal), pp=np.float32(pp),
                         hw=np.int32([h, w]), kernel="beta" if "beta" in g else "gauss", restored="swimm3r_stage1", **extra)
     text = None
-    if args.bench and args.data_dir:
+    if args.proto and args.data_dir:
+        import bench_proto
+        import loc_ff
+        split = json.load(open(os.path.join(args.data_dir, "split.json")))
+        tests = sorted(split["test_files"], key=E.fnum)
+        poses_np = c2w.cpu().numpy().astype(np.float64)
+        loc = loc_ff.Localizer(net, feat, depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev, subsample=args.loc_subsample,
+                               reproj=args.loc_reproj)
+        loc_pub = None
+        if args.proto_public:
+            from mast3r.model import AsymmetricMASt3R
+            net_pub = AsymmetricMASt3R.from_pretrained(args.mast3r).to(dev).eval()
+            loc_pub = loc_ff.Localizer(net_pub, loc_ff.encode_frames(net_pub, imgs), depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev,
+                                       subsample=args.loc_subsample, reproj=args.loc_reproj, name="public MASt3R")
+        quick = bool(args.proto_quick)
+        res = bench_proto.run(dict(
+            dev=dev, tests=tests, centre=split.get("centre_files", []), fps=args.fps, unit=unit, lr=args.pose_lr, warmup=args.bench_warmup,
+            map_nums=fnums, map_poses=poses_np, interp=E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums),
+            load=lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev),
+            medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score, loc=loc, loc_public=loc_pub,
+            out_dir=args.out_dir, rc_steps=[k for k in args.proto_rc_steps if not quick or k <= 100], ff_steps=args.proto_ff_steps,
+            topk=args.proto_topk, ref_steps=min(args.proto_ref_steps, 100) if quick else args.proto_ref_steps,
+            ref_check=min(args.proto_ref_check, 200) if quick else args.proto_ref_check, ref_frames=args.proto_ref_frames,
+            ref_tol=args.proto_ref_tol, px_tol=args.proto_px, levels=bench_proto.LEVELS[:2] if quick else bench_proto.LEVELS))
+        mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
+        n_far = int(g_far["n_out"]) if g_far is not None else 0
+        n_win = int(sum(m_["n_out"] for _, m_ in tmaps)) if tmaps else 0
+        text = bench_proto.report(res, dict(
+            scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, warmup=args.bench_warmup,
+            map_mb=sum(g[k].numel() for k in ("xyz", "scales", "quat", "opacity", "J", "gate", "tw", "tb", "vel", "t_src") if k in g) * 4 / 1e6,
+            mapping_seconds=args.bench_mapping_seconds, model=args.lora, public=loc_pub is not None,
+            weights_mb={"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}))
+        text += (f"\nrender path {args.medium_raster}, veil fit {'on' if args.binf_veil else 'off'}, time windows "
+                 f"{args.time_bucket if tmaps else 0} ({n_win} primitives), far layer {n_far} primitives")
+        open(os.path.join(args.out_dir, "protocol.txt"), "w").write(text + "\n")
+        out["proto"] = res
+    elif args.bench and args.data_dir:
         import bench_loc
         tests = sorted(json.load(open(os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)
         poses_np = c2w.cpu().numpy().astype(np.float64)
@@ -846,7 +899,8 @@ def main():
         open(os.path.join(args.out_dir, "benchmark.txt"), "w").write(text + "\n")
         out["bench"] = res
     if dev.type == "cuda":
-        out["gpu_peak_gib"] = max(torch.cuda.max_memory_allocated() / 2 ** 30, out.get("bench", {}).get("memory", {}).get("gpu_peak_gib", 0.0))
+        out["gpu_peak_gib"] = max(torch.cuda.max_memory_allocated() / 2 ** 30, out.get("bench", {}).get("memory", {}).get("gpu_peak_gib", 0.0),
+                                  out.get("proto", {}).get("memory", {}).get("gpu_peak_gib", 0.0))
         print(f"[memory] peak GPU memory of the map and the localization {out['gpu_peak_gib']:.2f} GiB", flush=True)
     out["seconds_total"] = time.time() - t0
     json.dump(out, open(os.path.join(args.out_dir, "scores.json"), "w"), indent=1)
