@@ -220,6 +220,22 @@ def main():
     ap.add_argument("--proto_px", type=float, default=2.0, help="--proto: a pose counts as registered when the map points shift by at most this many px")
     ap.add_argument("--loc_subsample", type=int, default=8, help="--proto: grid of the matching in px")
     ap.add_argument("--loc_reproj", type=float, default=None, help="--proto: PnP threshold in px (default 0.008 of the image diagonal)")
+    ap.add_argument("--gscpe", action="store_true",
+                    help="localization protocol of GS-CPE (arXiv 2608.10938, tools/bench_gscpe.py): the queries of --split_json never enter the "
+                         "mapping, their reference poses come from a reconstruction of all frames (--proto_ref_scene or --proto_ref_poses); "
+                         "retrieval, render of the map with depth, matching, PnP in passes, warping refinement (tools/loc_warp.py); median "
+                         "errors, accuracy at four thresholds and runtime per query, saved as gscpe.txt and gscpe.json")
+    ap.add_argument("--gscpe_passes", type=int, default=3, help="--gscpe: passes of render, match and PnP in the coarse stage")
+    ap.add_argument("--gscpe_levels", type=int, default=2, help="--gscpe: halvings of the image pyramid of the refinement")
+    ap.add_argument("--gscpe_steps", type=int, default=20, help="--gscpe: Adam steps on every pyramid level")
+    ap.add_argument("--gscpe_lr", type=float, default=3e-4)
+    ap.add_argument("--gscpe_views", type=int, default=4, help="--gscpe: nearby views that vote the visibility mask")
+    ap.add_argument("--gscpe_no_ablation", action="store_true", help="--gscpe: leave out the rows without the pyramid, the mask and the water model")
+    ap.add_argument("--gscpe_depth_m", type=float, default=None,
+                    help="--gscpe: median depth of the map in metres when it is known, the table is then also given in cm")
+    ap.add_argument("--proto_ref_poses", default=None,
+                    help="--proto and --gscpe: reference poses of all frames from another reconstruction, a COLMAP model (folder, images.bin "
+                         "or images.txt) or a json of name to camera to world 4 x 4, moved into this map like --proto_ref_scene")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -570,55 +586,71 @@ def main():
         fill = bool(args.time_fill and tmaps and t is not None)
         return ([None, g] if fill else [None]) + ([g_far] if g_far is not None else [])
 
-    def render(pose, m1, f=focal, c=pp, hw=(h, w), which="underwater", t=None, gm=None, alpha=False):
+    def zmap(dacc, a, hw):
+        a = a.reshape(hw[0], hw[1])
+        d = dacc.reshape(hw[0], hw[1]) / a.clamp_min(1e-6) / float(unit)
+        return torch.where((a > 0.05) & torch.isfinite(d) & (d > 1e-6), d, torch.zeros_like(d))
+
+    def render(pose, m1, f=focal, c=pp, hw=(h, w), which="underwater", t=None, gm=None, alpha=False, depth=False):
         ls = stack(t, gm)
         if len(ls) == 1 or not (args.medium_raster == "preshade" and (which == "restored" or "B_inf_map" in m1)):
-            return render_one(pose, m1, f, c, hw, which, t, gm, alpha)
-        img_, tr_ = 0.0, 1.0
+            return render_one(pose, m1, f, c, hw, which, t, gm, alpha, depth=depth)
+        img_, tr_, dz_ = 0.0, 1.0, 0.0
         if which == "restored":
             cu_ = pose.clone()
             cu_[:3, 3] = pose[:3, 3] * unit
             for l_ in ls:
                 gl_ = at_time(t, l_)
-                r_, _, a_ = rv(gl_, gl_["J"], cu_, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+                r_, d_, a_ = rv(gl_, gl_["J"], cu_, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
                 img_ = img_ + tr_ * r_
+                dz_ = dz_ + tr_ * d_.reshape(1, hw[0], hw[1])
                 tr_ = tr_ * (1.0 - a_.reshape(1, hw[0], hw[1]))
-            return img_
+            return (img_, 1.0 - tr_[0], zmap(dz_, 1.0 - tr_, hw)) if depth else img_
         for l_ in ls:
-            o_, a_ = render_one(pose, m1, f, c, hw, which, t, l_, True, obj=True)
+            o_, a_, d_ = render_one(pose, m1, f, c, hw, which, t, l_, True, obj=True)
             img_ = img_ + tr_ * o_
+            dz_ = dz_ + tr_ * d_.reshape(1, hw[0], hw[1])
             tr_ = tr_ * (1.0 - a_.reshape(1, hw[0], hw[1]))
         img_ = img_ + tr_ * background(m1, hw[0], hw[1]).float()
+        if depth:
+            return img_, 1.0 - tr_[0], zmap(dz_, 1.0 - tr_, hw)
         return (img_, 1.0 - tr_[0]) if alpha else img_
 
-    def render_one(pose, m1, f=focal, c=pp, hw=(h, w), which="underwater", t=None, gm=None, alpha=False, obj=False):
+    def render_one(pose, m1, f=focal, c=pp, hw=(h, w), which="underwater", t=None, gm=None, alpha=False, obj=False, depth=False):
         gg = at_time(t, gm)
         cu = pose.clone()
         cu[:3, 3] = pose[:3, 3] * unit
         if which == "restored":
-            return rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)[0]
+            im_, d_, a_ = rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+            return (im_, a_.reshape(hw[0], hw[1]), zmap(d_, a_, hw)) if depth else im_
         if args.medium_raster == "s2" and "beta" in gg:
             with torch.no_grad():
                 _, dacc, a0 = rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
                 m_rgb, m_bs, m_attn = MR.medium_maps(phys, m1, MR.expected_depth(dacc, a0, unit), unit)
             img, _, _ = MR.render_medium_view(gg["means"], gg["opacity"], gg["scales"], gg["quat"], gg["J"], gg["beta"], cu, f, hw[0], hw[1],
                                               c, m_rgb, m_bs, m_attn, scale_factor=K_BETA4, eps2d=EPS2D_BETA4, deconf=bool(args.grad_deconf))
+            if depth:
+                return img, a0.reshape(hw[0], hw[1]), zmap(dacc, a0, hw)
             return (img, a0.reshape(hw[0], hw[1])) if alpha else img
         xc = (gg["xyz"] - pose[:3, 3]) @ pose[:3, :3]
         zc = xc[:, 2]
         if "B_inf_map" not in m1:
             col = underwater_colours(phys, gg["J"], zc, m1)
-            img, _, alp = rv(gg, col, cu, f, hw[0], hw[1], m1["B_inf"].float().contiguous(), c)
+            img, d_, alp = rv(gg, col, cu, f, hw[0], hw[1], m1["B_inf"].float().contiguous(), c)
+            if depth:
+                return img, alp.reshape(hw[0], hw[1]), zmap(d_, alp, hw)
             return (img, alp.reshape(hw[0], hw[1])) if alpha else img
         # direction dependent B_inf: the map of the Stage 1 grid (h, w) sampled at the pixel of every primitive,
         # open water the map resampled to the render size
         zs = torch.where(zc > 1e-6, zc, torch.ones_like(zc))
         uv = torch.stack([(f * xc[:, 0] / zs + c[0]) * w / hw[1], (f * xc[:, 1] / zs + c[1]) * h / hw[0]], dim=-1)
         col = underwater_colours(phys, gg["J"], zc, m1, uv)
-        img, _, alp = rv(gg, col, cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+        img, d_, alp = rv(gg, col, cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
         if obj:
-            return img, alp.reshape(hw[0], hw[1])
+            return img, alp.reshape(hw[0], hw[1]), d_
         img = img + (1.0 - alp.reshape(1, hw[0], hw[1])) * background(m1, hw[0], hw[1]).float()
+        if depth:
+            return img, alp.reshape(hw[0], hw[1]), zmap(d_, alp, hw)
         return (img, alp.reshape(hw[0], hw[1])) if alpha else img
 
     def refine(p0, gt, m1, t=None):
@@ -738,7 +770,7 @@ def main():
               f"squared error uncovered | on the single view cover: fused {dmean['fused_on_single_cover']:.2f} single "
               f"{dmean['single_on_single_cover']:.2f} | medium of the nearest other frames {dmean['fused_nearest_other_medium']:.2f}", flush=True)
 
-    if args.data_dir and not (args.bench or args.proto):
+    if args.data_dir and not (args.bench or args.proto or args.gscpe):
         split = json.load(open(os.path.join(args.data_dir, "split.json")))
         centre = set(E.fnum(x) for x in split.get("centre_files", []))
         tests = sorted(split["test_files"], key=E.fnum)
@@ -845,7 +877,7 @@ def main():
                         kf_c2w=c2w.cpu().numpy(), frame_c2w=c2w.cpu().numpy(), focal=np.float32(focal), pp=np.float32(pp),
                         hw=np.int32([h, w]), kernel="beta" if "beta" in g else "gauss", restored="swimm3r_stage1", **extra)
     text = None
-    if args.proto and args.data_dir:
+    if (args.proto or args.gscpe) and args.data_dir:
         import bench_proto
         import loc_ff
         import loc_geom
@@ -854,52 +886,77 @@ def main():
         poses_np = c2w.cpu().numpy().astype(np.float64)
         loc = loc_ff.Localizer(net, feat, depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev, subsample=args.loc_subsample,
                                reproj=args.loc_reproj)
-        ref_poses, ref_fit = None, None
-        if args.proto_ref_scene:
+        ref_poses, ref_fit, ref_text, ref_src = None, None, None, None
+        if args.proto_ref_poses:
+            rn, rp = loc_geom.read_poses(args.proto_ref_poses)
+            ref_src = (rn, rp, args.proto_ref_poses, "poses of an external reconstruction of all frames, the queries included (%s)" % args.proto_ref_poses)
+        elif args.proto_ref_scene:
             import pickle
             with open(os.path.join(args.proto_ref_scene, "scene.pkl"), "rb") as f:
                 rs = pickle.load(f)
-            got = loc_geom.transfer_poses([os.path.basename(q) for q in rs.img_paths], rs.cam2w.detach().float().cpu().numpy(), list(names), poses_np, tests)
+            ref_src = ([os.path.basename(q) for q in rs.img_paths], rs.cam2w.detach().float().cpu().numpy(), args.proto_ref_scene,
+                       "poses of an offline mapping of all frames by the same model (map frames and queries together), no external reconstruction")
             del rs
+        if ref_src is not None:
+            got = loc_geom.transfer_poses(ref_src[0], ref_src[1], list(names), poses_np, tests)
             if got is None:
-                print("[proto] the reference scene shares fewer than 3 frames with this map, the reference is made on this map", flush=True)
+                print("[proto] the reference shares fewer than 3 frames with this map, the reference is made on this map", flush=True)
             else:
                 ref_poses, fit = got
                 tp = 100.0 * np.asarray(fit["et"]) / loc.depths[fit["idx"]]
                 ref_fit = dict(n=fit["n"], scale=fit["scale"], t_med=float(np.median(tp)), t_max=float(tp.max()), r_med=float(np.median(fit["er"])),
                                r_max=float(np.max(fit["er"])))
+                ref_text = ref_src[3]
                 print("[proto] reference from %s: %d of %d queries, fitted on %d map frames, scale %.3f, map frames differ by a median of %.2f %% of depth "
-                      "and %.2f deg" % (args.proto_ref_scene, len(ref_poses), len(tests), fit["n"], fit["scale"], ref_fit["t_med"], ref_fit["r_med"]), flush=True)
+                      "and %.2f deg" % (ref_src[2], len(ref_poses), len(tests), fit["n"], fit["scale"], ref_fit["t_med"], ref_fit["r_med"]), flush=True)
         loc_pub = None
         if args.proto_public:
             from mast3r.model import AsymmetricMASt3R
             net_pub = AsymmetricMASt3R.from_pretrained(args.mast3r).to(dev).eval()
             loc_pub = loc_ff.Localizer(net_pub, loc_ff.encode_frames(net_pub, imgs), depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev,
                                        subsample=args.loc_subsample, reproj=args.loc_reproj, name="public MASt3R")
-        quick = bool(args.proto_quick)
-        res = bench_proto.run(dict(
-            dev=dev, tests=tests, centre=split.get("centre_files", []), fps=args.fps, unit=unit, lr=args.pose_lr, warmup=args.bench_warmup,
-            map_nums=fnums, map_poses=poses_np, interp=E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums),
-            load=lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev),
-            medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score, loc=loc, loc_public=loc_pub,
-            out_dir=args.out_dir, rc_steps=[k for k in args.proto_rc_steps if not quick or k <= 100], ff_steps=args.proto_ff_steps,
-            topk=args.proto_topk, ref_steps=min(args.proto_ref_steps, 100) if quick else args.proto_ref_steps,
-            ref_check=min(args.proto_ref_check, 200) if quick else args.proto_ref_check, ref_frames=args.proto_ref_frames,
-            ref_tol=args.proto_ref_tol, px_tol=args.proto_px, levels=bench_proto.LEVELS[:2] if quick else bench_proto.LEVELS,
-            map_names=list(names), strides=args.proto_strides, gaps=args.proto_gaps, only_thinned=args.proto_only_thinned,
-            tasks=args.proto_tasks, ref_poses=ref_poses, ref_fit=ref_fit))
         mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
         n_far = int(g_far["n_out"]) if g_far is not None else 0
         n_win = int(sum(m_["n_out"] for _, m_ in tmaps)) if tmaps else 0
-        text = bench_proto.report(res, dict(
-            scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, warmup=args.bench_warmup,
-            map_mb=sum(g[k].numel() for k in ("xyz", "scales", "quat", "opacity", "J", "gate", "tw", "tb", "vel", "t_src") if k in g) * 4 / 1e6,
-            mapping_seconds=args.bench_mapping_seconds, model=args.lora, public=loc_pub is not None,
-            weights_mb={"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}))
-        text += (f"\nrender path {args.medium_raster}, veil fit {'on' if args.binf_veil else 'off'}, time windows "
-                 f"{args.time_bucket if tmaps else 0} ({n_win} primitives), far layer {n_far} primitives")
-        open(os.path.join(args.out_dir, "protocol.txt"), "w").write(text + "\n")
-        out["proto"] = res
+        map_mb = sum(g[k].numel() for k in ("xyz", "scales", "quat", "opacity", "J", "gate", "tw", "tb", "vel", "t_src") if k in g) * 4 / 1e6
+        weights_mb = {"LoRA": mb(args.lora), "physics head": mb(args.physics), "Gaussian head": mb(args.head)}
+        tail = (f"\nrender path {args.medium_raster}, veil fit {'on' if args.binf_veil else 'off'}, time windows "
+                f"{args.time_bucket if tmaps else 0} ({n_win} primitives), far layer {n_far} primitives")
+        load_query = lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev)
+        if args.proto:
+            quick = bool(args.proto_quick)
+            res = bench_proto.run(dict(
+                dev=dev, tests=tests, centre=split.get("centre_files", []), fps=args.fps, unit=unit, lr=args.pose_lr, warmup=args.bench_warmup,
+                map_nums=fnums, map_poses=poses_np, interp=E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums), load=load_query,
+                medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score, loc=loc, loc_public=loc_pub,
+                out_dir=args.out_dir, rc_steps=[k for k in args.proto_rc_steps if not quick or k <= 100], ff_steps=args.proto_ff_steps,
+                topk=args.proto_topk, ref_steps=min(args.proto_ref_steps, 100) if quick else args.proto_ref_steps,
+                ref_check=min(args.proto_ref_check, 200) if quick else args.proto_ref_check, ref_frames=args.proto_ref_frames,
+                ref_tol=args.proto_ref_tol, px_tol=args.proto_px, levels=bench_proto.LEVELS[:2] if quick else bench_proto.LEVELS,
+                map_names=list(names), strides=args.proto_strides, gaps=args.proto_gaps, only_thinned=args.proto_only_thinned,
+                tasks=args.proto_tasks, ref_poses=ref_poses, ref_fit=ref_fit))
+            text = bench_proto.report(res, dict(
+                scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, warmup=args.bench_warmup,
+                map_mb=map_mb, mapping_seconds=args.bench_mapping_seconds, model=args.lora, public=loc_pub is not None, weights_mb=weights_mb)) + tail
+            open(os.path.join(args.out_dir, "protocol.txt"), "w").write(text + "\n")
+            out["proto"] = res
+        if args.gscpe and not ref_poses:
+            print("[gscpe] no reference poses of the queries (--proto_ref_scene or --proto_ref_poses), the GS-CPE protocol is left out", flush=True)
+        elif args.gscpe:
+            import bench_gscpe
+            gres = bench_gscpe.run(dict(
+                dev=dev, tests=tests, fps=args.fps, warmup=args.bench_warmup, map_nums=fnums, load=load_query,
+                medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score, loc=loc, loc_public=loc_pub,
+                out_dir=args.out_dir, ref_poses=ref_poses, ref_fit=ref_fit, ref_source=ref_src[2], coarse_iters=args.gscpe_passes,
+                levels=args.gscpe_levels, steps=args.gscpe_steps, lr=args.gscpe_lr, views=args.gscpe_views,
+                ablation=not args.gscpe_no_ablation, depth_m=args.gscpe_depth_m))
+            gtext = bench_gscpe.report(gres, dict(
+                scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
+                mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,
+                split="test : train = 1 : %.1f" % (n / max(len(tests), 1)))) + tail
+            open(os.path.join(args.out_dir, "gscpe.txt"), "w").write(gtext + "\n")
+            out["gscpe"] = gres
+            text = gtext if text is None else text + "\n" + gtext
     elif args.bench and args.data_dir:
         import bench_loc
         tests = sorted(json.load(open(args.split_json or os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)
@@ -925,7 +982,8 @@ def main():
         out["bench"] = res
     if dev.type == "cuda":
         out["gpu_peak_gib"] = max(torch.cuda.max_memory_allocated() / 2 ** 30, out.get("bench", {}).get("memory", {}).get("gpu_peak_gib", 0.0),
-                                  out.get("proto", {}).get("memory", {}).get("gpu_peak_gib", 0.0))
+                                  out.get("proto", {}).get("memory", {}).get("gpu_peak_gib", 0.0),
+                                  out.get("gscpe", {}).get("memory", {}).get("gpu_peak_gib", 0.0))
         print(f"[memory] peak GPU memory of the map and the localization {out['gpu_peak_gib']:.2f} GiB", flush=True)
     out["seconds_total"] = time.time() - t0
     json.dump(out, open(os.path.join(args.out_dir, "scores.json"), "w"), indent=1)

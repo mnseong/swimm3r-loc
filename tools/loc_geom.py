@@ -132,6 +132,73 @@ def transfer_poses(ref_names, ref_poses, map_names, map_poses, want):
     return out, dict(n=len(pairs), scale=float(s), idx=[i for i, _ in pairs], et=et, er=er)
 
 
+def motion(a, b):
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    c = 0.5 * (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0)
+    return float(np.linalg.norm(a[:3, 3] - b[:3, 3])), float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+
+def quat_rot(q):
+    w, x, y, z = np.asarray(q, dtype=np.float64) / max(float(np.linalg.norm(q)), 1e-12)
+    return np.array([[1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                     [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                     [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)]])
+
+
+def _colmap_pose(q, t):
+    w2c = np.eye(4)
+    w2c[:3, :3] = quat_rot(q)
+    w2c[:3, 3] = np.asarray(t, dtype=np.float64)
+    return np.linalg.inv(w2c)
+
+
+def read_poses(path):
+    import json
+    import os
+    import struct
+    if os.path.isdir(path):
+        for sub in ("", "sparse/0", "sparse", "0"):
+            for f in ("images.bin", "images.txt"):
+                q = os.path.join(path, sub, f)
+                if os.path.isfile(q):
+                    return read_poses(q)
+        raise FileNotFoundError("no images.bin or images.txt under %s" % path)
+    names, poses = [], []
+    if path.endswith(".json"):
+        d = json.load(open(path))
+        items = d.items() if isinstance(d, dict) else [(x["name"], x) for x in d]
+        for n, v in items:
+            m = np.asarray(v["c2w"] if isinstance(v, dict) else v, dtype=np.float64)
+            if m.shape == (4, 4):
+                names.append(os.path.basename(str(n)))
+                poses.append(m)
+    elif path.endswith(".bin"):
+        with open(path, "rb") as f:
+            for _ in range(struct.unpack("<Q", f.read(8))[0]):
+                v = struct.unpack("<I7dI", f.read(64))
+                name = b""
+                while True:
+                    ch = f.read(1)
+                    if ch in (b"\x00", b""):
+                        break
+                    name += ch
+                f.seek(24 * struct.unpack("<Q", f.read(8))[0], 1)
+                names.append(os.path.basename(name.decode("utf-8")))
+                poses.append(_colmap_pose(v[1:5], v[5:8]))
+    else:
+        rows = [l.strip() for l in open(path) if l.strip() and not l.startswith("#")]
+        for l in rows:
+            p = l.split()
+            if len(p) >= 10 and p[9].lower().endswith((".jpg", ".jpeg", ".png")):
+                try:
+                    v = [float(x) for x in p[1:8]]
+                except ValueError:
+                    continue
+                names.append(os.path.basename(" ".join(p[9:])))
+                poses.append(_colmap_pose(v[:4], v[4:7]))
+    return names, np.asarray(poses, dtype=np.float64)
+
+
 def _to_x(c2w):
     w2c = np.linalg.inv(np.asarray(c2w, dtype=np.float64))
     return np.r_[rotvec(w2c[:3, :3]), w2c[:3, 3]]

@@ -126,6 +126,35 @@ class Localizer:
             return np.zeros((0, 2)), np.zeros((0, 3)), found, t1 - t0, t2 - t1
         return np.concatenate(p2d), np.concatenate(p3d), found, t1 - t0, t2 - t1
 
+    @torch.no_grad()
+    def match_render(self, fq, img, depth, alpha, pose, min_alpha=0.5):
+        from mast3r.fast_nn import fast_reciprocal_NNs
+        sync(self.dev)
+        t0 = time.time()
+        fr, _, _ = self.net._encode_image(img[None].clamp(0.0, 1.0) * 2.0 - 1.0, self.shape)
+        sync(self.dev)
+        t1 = time.time()
+        d1, d2 = self.net._decoder(fq, self.pos, fr.to(fq.dtype), self.pos)
+        with torch.autocast("cuda", enabled=False):
+            r1 = self.net._downstream_head(1, [t.float() for t in d1], self.shape)
+            r2 = self.net._downstream_head(2, [t.float() for t in d2], self.shape)
+        sync(self.dev)
+        t2 = time.time()
+        xm, xq = fast_reciprocal_NNs(r2["desc"][0], r1["desc"][0], subsample_or_initxy1=self.subsample, ret_xy=True,
+                                     device=self.dev, dist="dot", block_size=2 ** 13)
+        found = len(xm)
+        p2d, p3d = np.zeros((0, 2)), np.zeros((0, 3))
+        if found:
+            xm = torch.as_tensor(np.ascontiguousarray(xm), device=self.dev, dtype=torch.long)
+            z = depth[xm[:, 1], xm[:, 0]].float()
+            ok = (alpha[xm[:, 1], xm[:, 0]] > min_alpha) & torch.isfinite(z) & (z > 1e-6)
+            c = torch.as_tensor(np.asarray(pose), dtype=torch.float32, device=self.dev)
+            cam = torch.stack([(xm[:, 0].float() - float(self.K[0, 2])) / self.focal * z, (xm[:, 1].float() - float(self.K[1, 2])) / self.focal * z, z], -1)
+            p3d = (cam @ c[:3, :3].T + c[:3, 3])[ok].double().cpu().numpy()
+            p2d = np.ascontiguousarray(xq, dtype=np.float64)[ok.cpu().numpy()]
+        sync(self.dev)
+        return p2d, p3d, int(found), dict(encoder=t1 - t0, decoder=t2 - t1, matching=time.time() - t2)
+
     def localize(self, img, prior=None, idx=None, topk=1):
         t = {}
         sync(self.dev)

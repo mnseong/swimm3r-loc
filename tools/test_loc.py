@@ -10,10 +10,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mast3r.utils.path_to_dust3r
+import bench_gscpe as C
 import bench_proto as P
 import eval_gaussian_map as E
 import loc_ff
 import loc_geom as G
+import loc_warp as Wp
 
 H, W_, FOCAL, DEPTH = 128, 192, 180.0, 4.0
 BALL, RADIUS = (2.4, 0.0, 11.0), 8.0
@@ -38,9 +40,13 @@ def surface_points(pose):
     return pose[:3, 3] + s[..., None] * d, s
 
 
-def render(pose, med=None, t=None, alpha=False):
-    p, _ = surface_points(pose)
+def render(pose, med=None, t=None, alpha=False, which="underwater", depth=False):
+    p, z = surface_points(pose)
     img = torch.stack([(p[..., 0] - X0) / RX, (p[..., 1] - Y0) / RY, 0.5 + 0.25 * torch.sin(3.0 * p[..., 0]) * torch.cos(2.0 * p[..., 1])])
+    if which == "restored":
+        img = img.clamp(0.0, 1.0) ** 0.6
+    if depth:
+        return img, torch.ones(H, W_), z
     return (img, torch.ones(H, W_)) if alpha else img
 
 
@@ -94,9 +100,168 @@ def check_geometry():
     assert not np.isfinite(f) or abs(f - 3.61) < 0.3, f
 
 
+def check_pose_files():
+    import json
+    import struct
+    rng = np.random.default_rng(5)
+    poses = []
+    for i in range(4):
+        q = np.eye(4)
+        q[:3, :3] = G.rot(rng.normal(scale=0.6, size=3))
+        q[:3, 3] = rng.normal(size=3)
+        poses.append(q)
+    names = ["%06d.jpg" % (3 * i) for i in range(4)]
+    d = tempfile.mkdtemp()
+
+    def qvec(r):
+        v = G.rotvec(r)
+        th = float(np.linalg.norm(v))
+        return np.r_[np.cos(0.5 * th), np.sin(0.5 * th) * v / max(th, 1e-12)]
+
+    w2c = [np.linalg.inv(q) for q in poses]
+    with open(os.path.join(d, "images.txt"), "w") as f:
+        f.write("# Image list\n")
+        for i, (n, m) in enumerate(zip(names, w2c)):
+            f.write("%d %s %s 1 frames/%s\n" % (i + 1, " ".join("%.17g" % x for x in qvec(m[:3, :3])), " ".join("%.17g" % x for x in m[:3, 3]), n))
+            f.write("10.5 20.25 -1 30.0 40.0 7 1.0 2.0 3 4.0 5.0 6\n" if i % 2 else "\n")
+    os.makedirs(os.path.join(d, "sparse", "0"))
+    with open(os.path.join(d, "sparse", "0", "images.bin"), "wb") as f:
+        f.write(struct.pack("<Q", len(names)))
+        for i, (n, m) in enumerate(zip(names, w2c)):
+            f.write(struct.pack("<I7dI", i + 1, *qvec(m[:3, :3]), *m[:3, 3], 1))
+            f.write(n.encode() + b"\x00")
+            f.write(struct.pack("<Q", 2))
+            f.write(struct.pack("<ddqddq", 1.0, 2.0, -1, 3.0, 4.0, 9))
+    json.dump({n: q.tolist() for n, q in zip(names, poses)}, open(os.path.join(d, "poses.json"), "w"))
+    worst = 0.0
+    for src in (os.path.join(d, "images.txt"), d, os.path.join(d, "poses.json")):
+        got_n, got_p = G.read_poses(src)
+        assert got_n == names, (src, got_n)
+        worst = max(worst, float(np.abs(got_p - np.asarray(poses)).max()))
+    print("poses read back from a COLMAP text model, a binary model and a json: largest difference %.1e" % worst)
+    assert worst < 1e-9, worst
+
+
+def check_warp():
+    tt = lambda p: torch.tensor(np.asarray(p), dtype=torch.float32)
+    K, hw = G.intrinsics(FOCAL, PP), (H, W_)
+    true = true_pose(12)
+    with torch.no_grad():
+        query = render(tt(true))
+        pts = surface_points(tt(true))[0].reshape(-1, 3)[::37].double().numpy()
+    rgbd = lambda p: render(tt(p), depth=True)
+    zed = lambda p: rgbd(p)[2]
+    start = G.perturb(true, 0.004 * DEPTH, 0.15, np.random.default_rng(9))
+    img, alpha, depth = rgbd(start)
+    mask, ok = Wp.visibility_mask(start, depth, alpha, K, zed)
+    off, _ = Wp.visibility_mask(start, depth, alpha, K, lambda p: 1.05 * zed(p))
+    print("visibility mask: %.3f of the pixels kept with consistent depth renders, %.3f when the nearby renders are 5 %% deeper" % (
+        float(mask.float().mean()), float(off.float().mean())))
+    assert float(mask.float().mean()) > 0.9 and float(off.float().mean()) < 0.05 and bool(ok.all())
+    e0 = G.pixel_shift(K, true, start, pts, hw)
+    out = {}
+    for label, kw in (("3 pyramid levels with the mask", {}), ("full resolution only", dict(levels=0, steps=60)), ("no mask", dict(use_mask=False))):
+        r = Wp.refine(query, start, K, rgbd, zed, **kw)
+        out[label] = G.pixel_shift(K, true, r["pose"], pts, hw)
+        print("warping refinement, %s: %.3f px -> %.3f px in %d steps, %d renders, %d mask renders, %d new anchors" % (
+            label, e0, out[label], r["steps"], r["renders"], r["mask_renders"], r["rerenders"]))
+        assert r["valid"] and r["steps"] == 60 and out[label] < 0.4 * e0, (label, e0, out[label])
+    dim = Wp.refine((0.8 * query + 0.05).clamp(0.0, 1.0), start, K, rgbd, zed, gain=True)
+    plain = Wp.refine((0.8 * query + 0.05).clamp(0.0, 1.0), start, K, rgbd, zed)
+    e_dim, e_plain = G.pixel_shift(K, true, dim["pose"], pts, hw), G.pixel_shift(K, true, plain["pose"], pts, hw)
+    print("warping refinement of a query at 0.8 of the brightness plus 0.05: %.3f px with the brightness fit, %.3f px without (start %.3f px)" % (e_dim, e_plain, e0))
+    assert e_dim < e_plain and e_dim < e0, (e_dim, e_plain, e0)
+    far = Wp.refine(query, G.perturb(true, 0.012 * DEPTH, 0.6, np.random.default_rng(4)), K, rgbd, zed)
+    print("warping refinement from 1.2 %% of depth and 0.6 deg: %d new anchors" % far["rerenders"])
+    assert far["rerenders"] >= 1 and far["renders"] == far["rerenders"] + 1 and far["mask_renders"] == 4 * far["renders"]
+    lv = Wp.level_intrinsics(K, 2)
+    assert abs(lv[0] - FOCAL / 4.0) < 1e-9 and abs(lv[2] - (K[0, 2] - 1.5) / 4.0) < 1e-9
+
+
+def check_gscpe():
+    dev = torch.device("cpu")
+    tt = lambda p: torch.tensor(np.asarray(p), dtype=torch.float32)
+    nums = list(range(2, 41))
+    hold = [i for i in nums if i % 4 == 1 and nums[0] < i < nums[-1]]
+    mapf = [i for i in nums if i not in hold]
+    name = lambda i: "%06d.jpg" % i
+    truth = {i: true_pose(i) for i in nums}
+    with torch.no_grad():
+        imgs = torch.stack([render(tt(truth[i])) for i in mapf])
+        depth = torch.stack([surface_points(tt(truth[i]))[1] for i in mapf])
+    c2w = torch.stack([tt(truth[i]) for i in mapf])
+    intr = torch.tensor([[FOCAL, 0.0, PP[0] - 0.5], [0.0, FOCAL, PP[1] - 0.5], [0.0, 0.0, 1.0]]).expand(len(mapf), 3, 3).contiguous()
+    net = StandIn()
+    loc = loc_ff.Localizer(net, loc_ff.encode_frames(net, imgs), depth, torch.full_like(depth, 2.0), intr, c2w, FOCAL, PP, 1.0, dev, subsample=4, reproj=2.5)
+    gen = torch.Generator().manual_seed(2)
+
+    def load(nm):
+        with torch.no_grad():
+            return (render(tt(truth[E.fnum(nm)])) + 0.004 * torch.randn(3, H, W_, generator=gen)).clamp(0.0, 1.0)
+
+    def score(img, gt):
+        mae = float((img.clamp(0, 1) - gt).abs().mean())
+        return [float(-10.0 * torch.log10(((img.clamp(0, 1) - gt) ** 2).mean() + 1e-12)), 1.0 - mae, mae]
+
+    seen = {"underwater": 0, "restored": 0}
+
+    def strict(pose, med=None, t=None, alpha=False, which="underwater", depth=False):
+        assert which in seen and (which == "restored" or med is not None) and t is not None, (which, med, t)
+        seen[which] += 1
+        return render(pose, med, t, alpha, which, depth)
+
+    with torch.no_grad():
+        fq = loc.encode(render(tt(truth[hold[0]])))
+    near = loc.near(truth[hold[0]], 1)[0]
+    ir, al, dp = render(tt(loc.poses[near]), depth=True)
+    p2d, p3d, found, st = loc.match_render(fq, ir, dp, al, loc.poses[near])
+    q2d, q3d = loc.match(fq, [near])[:2]
+    uv, z = G.project(loc.K, truth[hold[0]], p3d)
+    err = np.linalg.norm(uv - p2d, axis=1)
+    print("matching a query to a render at the pose of a map frame: %d matches lifted by the rendered depth, %.0f %% within 2 px of the true projection, "
+          "largest difference to the matches of the map frame itself %.1e" % (len(p2d), 100.0 * np.mean(err < 2.0), float(np.abs(p3d - q3d).max())))
+    assert found >= len(p2d) > 100 and float((torch.as_tensor(p3d) - torch.tensor(BALL, dtype=torch.float64)).norm(dim=-1).sub(RADIUS).abs().max()) < 1e-3
+    assert np.mean(err < 2.0) > 0.9 and set(st) == {"encoder", "decoder", "matching"}, np.mean(err < 2.0)
+    assert p2d.shape == q2d.shape and float(np.abs(p2d - q2d).max()) == 0.0 and float(np.abs(p3d - q3d).max()) < 1e-4
+
+    out_dir = tempfile.mkdtemp()
+    fit = dict(n=len(mapf), scale=1.0, t_med=0.0, t_max=0.0, r_med=0.0, r_max=0.0)
+    ctx = dict(dev=dev, tests=[name(i) for i in hold] + ["999999.jpg"], fps=5.0, warmup=1, map_nums=mapf, load=load, medium=lambda num, pose: {},
+               render=strict, score=score, loc=loc, loc_public=loc, out_dir=out_dir, ref_poses={name(i): truth[i] for i in hold}, ref_fit=fit,
+               ref_source="truth", depth_m=2.0)
+    res = C.run(ctx)
+    info = dict(scene="synthetic scene", map_frames=len(mapf), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in", mapping_seconds=None,
+                weights_mb={"none": 0.0}, reference="true poses of the synthetic scene", split="test : train = 1 : %.1f" % (len(mapf) / len(hold)))
+    text = C.report(res, info)
+    print(text)
+    row = lambda label: next(r for r in res["rows"] if r["label"] == label)
+    a0, a1, a2 = row("pose of the retrieved map frame"), row("coarse: render, match, PnP"), row("refine: + masked warping")
+    assert res["frames"] == len(hold) and res["skipped"] == 1 and "%%" not in text and os.path.isfile(os.path.join(out_dir, "gscpe.json"))
+    assert a1["fails"] == 0 and a1["acc"][0] == 100.0 and a1["acc"][1] == 100.0 and a1["t"] < 0.2 * a0["t"] and a1["px"] < 1.0, (a0, a1)
+    assert a2["px"] <= a1["px"] + 0.3 and a2["acc"][1] == 100.0 and a2["s_mean"] > a1["s_mean"] > a0["s_mean"], (a1, a2)
+    assert abs(a1["cm"] - 2.0 * a1["t"]) < 1e-9 and len(res["per_query"]["coarse: render, match, PnP"]) == len(hold)
+    labels = [r["label"] for r in res["rows"]]
+    for want in ("no render: match the map frame, PnP", "refine without the pyramid", "refine without the mask", "refine with a brightness fit", "no water model: coarse",
+                 "no water model: refine", "public MASt3R, no render: match, PnP", "public MASt3R matcher: coarse", "public MASt3R matcher: refine"):
+        assert want in labels, (want, labels)
+    assert row("no render: match the map frame, PnP")["acc"][1] == 100.0 and res["stages"]["iters"] <= 3.0 and res["retrieval"]["top1"] >= 80.0
+    assert "the same in cm" in text and "Runtime" in text and not [x for x in res["notes"] if G.cv2 is not None or "OpenCV is missing" not in x], res["notes"]
+    assert (G.cv2 is None) == any("OpenCV is missing" in x for x in res["notes"]) and res["solver"] != "none", (res["solver"], res["notes"])
+    dry = row("no water model: coarse")
+    assert seen["restored"] > 4 * len(hold) and (dry["t"], dry["r"]) != (a1["t"], a1["r"]), (seen, dry, a1)
+    assert row("public MASt3R matcher: coarse")["acc"][1] == 100.0 and "stages_public" in res
+    short = C.run(dict(ctx, out_dir=tempfile.mkdtemp(), ablation=False, loc_public=None, depth_m=None, coarse_iters=1, score=None))
+    short_text = C.report(short, info)
+    assert [r["label"] for r in short["rows"]] == labels[:4] and "the same in cm" not in short_text and short["stages"]["iters"] == 1.0
+    assert "lpips" not in short["rows"][1] and "%%" not in short_text
+
+
 def main():
     torch.manual_seed(0)
     check_geometry()
+    check_pose_files()
+    check_warp()
+    check_gscpe()
     dev = torch.device("cpu")
     nums = list(range(2, 41))
     map_nums = [i for i in nums if i % 8 in (2, 3, 4, 5, 6)]
