@@ -83,6 +83,55 @@ def perturb(c2w, trans, rot_deg, rng):
     return np.asarray(c2w, dtype=np.float64) @ m
 
 
+def similarity(a, b):
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    ma, mb = a.mean(0), b.mean(0)
+    xa, xb = a - ma, b - mb
+    U, D, Vt = np.linalg.svd(xb.T @ xa / len(a))
+    S = np.diag([1.0, 1.0, float(np.sign(np.linalg.det(U) * np.linalg.det(Vt))) or 1.0])
+    R = U @ S @ Vt
+    s = float(np.trace(np.diag(D) @ S) / max(float((xa ** 2).sum()) / len(a), 1e-18))
+    return s, R, mb - s * R @ ma
+
+
+def move_pose(s, R, t, pose):
+    pose = np.asarray(pose, dtype=np.float64)
+    out = np.eye(4)
+    out[:3, :3] = R @ pose[:3, :3]
+    out[:3, 3] = s * R @ pose[:3, 3] + t
+    return out
+
+
+def fit_poses(a, b):
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    ca, cb = a[:, :3, 3], b[:, :3, 3]
+    ra = float(np.sqrt(((ca - ca.mean(0)) ** 2).sum(1).mean()))
+    rb = float(np.sqrt(((cb - cb.mean(0)) ** 2).sum(1).mean()))
+    if ra < 1e-12 or rb < 1e-12:
+        return None
+    pa = np.concatenate([ca] + [ca + ra * a[:, :3, k] for k in range(3)])
+    pb = np.concatenate([cb] + [cb + rb * b[:, :3, k] for k in range(3)])
+    return similarity(pa, pb)
+
+
+def transfer_poses(ref_names, ref_poses, map_names, map_poses, want):
+    ref_names = list(ref_names)
+    pairs = [(i, ref_names.index(n)) for i, n in enumerate(map_names) if n in ref_names]
+    if len(pairs) < 3:
+        return None
+    A = np.asarray(ref_poses, dtype=np.float64)[[j for _, j in pairs]]
+    Bm = np.asarray(map_poses, dtype=np.float64)[[i for i, _ in pairs]]
+    fit = fit_poses(A, Bm)
+    if fit is None:
+        return None
+    s, R, t = fit
+    moved = [move_pose(s, R, t, p) for p in A]
+    et = [float(np.linalg.norm(m[:3, 3] - q[:3, 3])) for m, q in zip(moved, Bm)]
+    er = [float(np.degrees(np.arccos(np.clip(0.5 * (np.trace(m[:3, :3].T @ q[:3, :3]) - 1.0), -1.0, 1.0)))) for m, q in zip(moved, Bm)]
+    out = {n: move_pose(s, R, t, np.asarray(ref_poses, dtype=np.float64)[ref_names.index(n)]) for n in want if n in ref_names}
+    return out, dict(n=len(pairs), scale=float(s), idx=[i for i, _ in pairs], et=et, er=er)
+
+
 def _to_x(c2w):
     w2c = np.linalg.inv(np.asarray(c2w, dtype=np.float64))
     return np.r_[rotvec(w2c[:3, :3]), w2c[:3, 3]]

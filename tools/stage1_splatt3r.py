@@ -208,6 +208,9 @@ def main():
     ap.add_argument("--proto_ff_steps", type=int, nargs="+", default=[5, 10, 25])
     ap.add_argument("--proto_topk", type=int, nargs="+", default=[1, 3])
     ap.add_argument("--proto_strides", type=int, nargs="*", default=[4, 8], help="--proto: the store of map frames thinned to every Nth")
+    ap.add_argument("--split_json", default=None, help="queries of --proto and --bench from this file in place of split.json of --data_dir")
+    ap.add_argument("--proto_ref_scene", default=None, help="--proto: Stage 1 output of all frames, its poses moved into this map are the reference")
+    ap.add_argument("--proto_tasks", nargs="*", default=None, choices=["track", "reloc", "conv", "exact", "thinned"])
     ap.add_argument("--proto_only_thinned", action="store_true", help="--proto: only the reference (read back when it exists) and the thinned map tasks")
     ap.add_argument("--proto_gaps", type=int, nargs="*", default=[8, 16], help="--proto: stretches of this many frames taken out of the store")
     ap.add_argument("--proto_ref_steps", type=int, default=200)
@@ -845,11 +848,28 @@ def main():
     if args.proto and args.data_dir:
         import bench_proto
         import loc_ff
-        split = json.load(open(os.path.join(args.data_dir, "split.json")))
+        import loc_geom
+        split = json.load(open(args.split_json or os.path.join(args.data_dir, "split.json")))
         tests = sorted(split["test_files"], key=E.fnum)
         poses_np = c2w.cpu().numpy().astype(np.float64)
         loc = loc_ff.Localizer(net, feat, depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev, subsample=args.loc_subsample,
                                reproj=args.loc_reproj)
+        ref_poses, ref_fit = None, None
+        if args.proto_ref_scene:
+            import pickle
+            with open(os.path.join(args.proto_ref_scene, "scene.pkl"), "rb") as f:
+                rs = pickle.load(f)
+            got = loc_geom.transfer_poses([os.path.basename(q) for q in rs.img_paths], rs.cam2w.detach().float().cpu().numpy(), list(names), poses_np, tests)
+            del rs
+            if got is None:
+                print("[proto] the reference scene shares fewer than 3 frames with this map, the reference is made on this map", flush=True)
+            else:
+                ref_poses, fit = got
+                tp = 100.0 * np.asarray(fit["et"]) / loc.depths[fit["idx"]]
+                ref_fit = dict(n=fit["n"], scale=fit["scale"], t_med=float(np.median(tp)), t_max=float(tp.max()), r_med=float(np.median(fit["er"])),
+                               r_max=float(np.max(fit["er"])))
+                print("[proto] reference from %s: %d of %d queries, fitted on %d map frames, scale %.3f, map frames differ by a median of %.2f %% of depth "
+                      "and %.2f deg" % (args.proto_ref_scene, len(ref_poses), len(tests), fit["n"], fit["scale"], ref_fit["t_med"], ref_fit["r_med"]), flush=True)
         loc_pub = None
         if args.proto_public:
             from mast3r.model import AsymmetricMASt3R
@@ -866,7 +886,8 @@ def main():
             topk=args.proto_topk, ref_steps=min(args.proto_ref_steps, 100) if quick else args.proto_ref_steps,
             ref_check=min(args.proto_ref_check, 200) if quick else args.proto_ref_check, ref_frames=args.proto_ref_frames,
             ref_tol=args.proto_ref_tol, px_tol=args.proto_px, levels=bench_proto.LEVELS[:2] if quick else bench_proto.LEVELS,
-            map_names=list(names), strides=args.proto_strides, gaps=args.proto_gaps, only_thinned=args.proto_only_thinned))
+            map_names=list(names), strides=args.proto_strides, gaps=args.proto_gaps, only_thinned=args.proto_only_thinned,
+            tasks=args.proto_tasks, ref_poses=ref_poses, ref_fit=ref_fit))
         mb = lambda q: os.path.getsize(q) / 1e6 if q and os.path.isfile(q) else 0.0
         n_far = int(g_far["n_out"]) if g_far is not None else 0
         n_win = int(sum(m_["n_out"] for _, m_ in tmaps)) if tmaps else 0
@@ -881,7 +902,7 @@ def main():
         out["proto"] = res
     elif args.bench and args.data_dir:
         import bench_loc
-        tests = sorted(json.load(open(os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)
+        tests = sorted(json.load(open(args.split_json or os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)
         poses_np = c2w.cpu().numpy().astype(np.float64)
         res = bench_loc.run(dict(
             dev=dev, tests=tests, steps=args.bench_steps, inits=args.bench_init, fps=args.fps, unit=unit, lr=args.pose_lr,

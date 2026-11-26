@@ -95,8 +95,8 @@ def run(ctx):
         B.sync(dev)
         return m, time.time() - a
 
-    def steps_from(j, pose, marks):
-        num = nums[j]
+    def steps_from(j, pose, marks, num=None):
+        num = nums[j] if num is None else int(num)
         p0 = tens(pose)
         med, tm = medium_timed(num, p0)
         ps, ss = B.track(ctx["render"], image(j), p0, med, num / fps, ctx["unit"], ctx["lr"], list(marks), dev)
@@ -117,7 +117,29 @@ def run(ctx):
             out.update(et=et, er=er, px=G.pixel_shift(loc.K, r["pose"], pose, r["points"], hw))
         return out
 
+    def gap_of(j, ref):
+        r = ref.get(j)
+        if not r or not r["verified"]:
+            return None
+        et, er = G.pose_error(loc.poses[r["near"]], r["pose"], r["depth"])
+        seen = max(G.covisible(loc.K, r["pose"], loc.poses[k], r["points"], hw) for k in loc.near(r["pose"], 6))
+        return dict(t=et, r=er, seen=float(seen))
+
     def reference():
+        given = ctx.get("ref_poses")
+        if given:
+            ref, t0 = {}, time.time()
+            for j in order:
+                known = tests[j] in given
+                p = np.asarray(given[tests[j]] if known else ctx["interp"][j], dtype=np.float64)
+                near = int(loc.near(p, 1)[0])
+                depth, pts = float(loc.depths[near]), loc.points[near]
+                r = loc.localize(image(j), prior=p, idx=loc.near(p, int(ctx["ref_frames"])))
+                geo = np.asarray(r["pose"], dtype=np.float64)
+                pn = list(G.pose_error(geo, p, depth)) + [G.pixel_shift(loc.K, p, geo, pts, hw)]
+                ref[j] = dict(pose=p, geo=geo, near=near, depth=depth, points=pts, verified=known, check=[0.0, 0.0, 0.0], pnp=pn,
+                              pnp_ok=bool(r["ok"]), matches=r["matches"], inliers=r["inliers"], frame=nums[j])
+            return ref, time.time() - t0
         path = os.path.join(ctx["out_dir"], "reference.json")
         key = dict(steps=int(ctx["ref_steps"]), check=int(ctx["ref_check"]), frames=int(ctx["ref_frames"]), tol=ref_tol,
                    tests=[tests[j] for j in order], lr=float(ctx["lr"]), map_frames=int(loc.n))
@@ -165,13 +187,13 @@ def run(ctx):
             r = lz.localize(image(j), prior=prior, topk=topk)
             poses, sec = {0: np.asarray(r["pose"], dtype=np.float64)}, {0: r["seconds"]}
             if marks:
-                ps, ss = steps_from(j, poses[0], marks)
+                ps, ss = steps_from(j, poses[0], marks, None if mode == "track" else ctx["map_nums"][r["idx"][0]])
                 for k in marks:
                     poses[k], sec[k] = ps[k], r["seconds"] + ss[k]
             known[num] = poses[max(poses)]
             ev = {k: evaluate(j, poses[k], ref) for k in poses}
             rows.append(dict(frame=num, ok=bool(r["ok"]), idx=r["idx"], matches=r["matches"], inliers=r["inliers"], stages=r["stages"],
-                             solver=r["solver"], sec=sec, ev=ev))
+                             solver=r["solver"], sec=sec, ev=ev, gap=gap_of(j, ref)))
             print("[proto] %s, frame %06d: %d inliers of %d matches in %.0f ms, LPIPS %.3f%s" % (
                 label, num, r["inliers"], r["matches"], 1e3 * r["seconds"], ev[0]["lpips"],
                 ", %.2f %% of depth and %.2f deg from the reference" % (ev[0]["et"], ev[0]["er"]) if "et" in ev[0] else ""), flush=True)
@@ -183,7 +205,7 @@ def run(ctx):
         for j in order:
             num = nums[j]
             p0, pre, extra = start(j, known)
-            ps, ss = steps_from(j, p0, marks)
+            ps, ss = steps_from(j, p0, marks, ctx["map_nums"][extra["idx"][0]] if "idx" in extra else None)
             poses = dict(ps)
             poses[0] = np.asarray(p0, dtype=np.float64)
             known[num] = poses[marks[-1]]
@@ -231,7 +253,8 @@ def run(ctx):
                             map_frames=int(ctx["ref_frames"]), tol=ref_tol, seconds=ref_seconds,
                             check_median=med_cols(ck), check_p90=med_cols(ck, 90),
                             pnp_median=med_cols(pn) if len(pn) else None, pnp_ok=int(len(pn)),
-                            depth_median=float(np.median([ref[j]["depth"] for j in order])))
+                            depth_median=float(np.median([ref[j]["depth"] for j in order])), given=bool(ctx.get("ref_poses")), fit=ctx.get("ref_fit"))
+    tasks = set(ctx.get("tasks") or ["track", "reloc", "conv", "exact", "thinned"])
     save()
     if ctx.get("only_reference"):
         tegra.stop()
@@ -240,122 +263,130 @@ def run(ctx):
     def passes():
         rc_marks = sorted(set(int(k) for k in ctx["rc_steps"] if int(k) > 0))
         ff_marks = sorted(set(int(k) for k in ctx["ff_steps"] if int(k) > 0))
-        rows, win = pass_rc(lambda j, known: (B.predict_pose(known, nums[j]), 0.0, {}), rc_marks, ref, "tracking, render and compare")
-        res["tracking"].append(line("start pose, no computation", "prior", rows, 0, None))
-        for k in rc_marks:
-            res["tracking"].append(line("render and compare %d" % k, "render and compare", rows, k, win))
-        save()
-        rows, win = pass_ff(loc, "track", 1, [], ref, "tracking, matching and PnP")
-        res["tracking"].append(line("matching + PnP", "feed forward", rows, 0, win))
-        res["stages"] = stages(rows)
-        solvers = [r["solver"] for r in rows if r["ok"]]
-        res["solver"] = max(set(solvers), key=solvers.count) if solvers else "none"
-        if ff_marks:
-            rows, win = pass_ff(loc, "track", 1, ff_marks, ref, "tracking, matching and PnP with steps")
-            for k in ff_marks:
-                res["tracking"].append(line("matching + PnP + %d steps" % k, "feed forward with steps", rows, k, win))
-        save()
-        if ctx.get("loc_public") is not None:
+        if "track" in tasks:
+            rows, win = pass_rc(lambda j, known: (B.predict_pose(known, nums[j]), 0.0, {}), rc_marks, ref, "tracking, render and compare")
+            res["tracking"].append(line("start pose, no computation", "prior", rows, 0, None))
+            for k in rc_marks:
+                res["tracking"].append(line("render and compare %d" % k, "render and compare", rows, k, win))
+            save()
+            rows, win = pass_ff(loc, "track", 1, [], ref, "tracking, matching and PnP")
+            res["tracking"].append(line("matching + PnP", "feed forward", rows, 0, win))
+            res["stages"] = stages(rows)
+            solvers = [r["solver"] for r in rows if r["ok"]]
+            res["solver"] = max(set(solvers), key=solvers.count) if solvers else "none"
+            if ff_marks:
+                rows, win = pass_ff(loc, "track", 1, ff_marks, ref, "tracking, matching and PnP with steps")
+                for k in ff_marks:
+                    res["tracking"].append(line("matching + PnP + %d steps" % k, "feed forward with steps", rows, k, win))
+            save()
+            if ctx.get("loc_public") is not None:
+                try:
+                    rows, win = pass_ff(ctx["loc_public"], "track", 1, [], ref, "tracking, public MASt3R")
+                    res["tracking"].append(line("public MASt3R, matching + PnP", "public", rows, 0, win))
+                except Exception as e:
+                    res["notes"].append("public MASt3R tracking failed: %s: %s" % (type(e).__name__, e))
+            res["tracking"] = [r for r in res["tracking"] if r]
+            save()
+
+        if "reloc" in tasks:
             try:
-                rows, win = pass_ff(ctx["loc_public"], "track", 1, [], ref, "tracking, public MASt3R")
-                res["tracking"].append(line("public MASt3R, matching + PnP", "public", rows, 0, win))
+                good = {1: 0, 3: 0}
+                for j in ver:
+                    idx, _ = loc.retrieve(loc.encode(image(j)), 3)
+                    cv = [G.covisible(loc.K, ref[j]["pose"], loc.poses[i], ref[j]["points"], hw) >= float(ctx.get("covisible", 0.3)) for i in idx]
+                    good[1] += int(cv[0])
+                    good[3] += int(any(cv))
+                res["retrieval"] = dict(n=len(ver), top1=100.0 * good[1] / max(len(ver), 1), top3=100.0 * good[3] / max(len(ver), 1),
+                                        covisible=float(ctx.get("covisible", 0.3)))
             except Exception as e:
-                res["notes"].append("public MASt3R tracking failed: %s: %s" % (type(e).__name__, e))
-        res["tracking"] = [r for r in res["tracking"] if r]
-        save()
+                res["notes"].append("retrieval check failed: %s: %s" % (type(e).__name__, e))
+            for k in sorted(set(int(x) for x in ctx["topk"])):
+                rows, win = pass_ff(loc, "reloc", k, [], ref, "relocalization, best %d map frames" % k)
+                res["reloc"].append(line("matching + PnP, best %d" % k, "feed forward", rows, 0, win))
+                if k == 1:
+                    res["stages_reloc"] = stages(rows)
+                    res["difficulty"] = difficulty(rows, px_tol)
+            if ff_marks:
+                rows, win = pass_ff(loc, "reloc", 1, ff_marks[-1:], ref, "relocalization, matching and PnP with steps")
+                res["reloc"].append(line("matching + PnP, best 1 + %d steps" % ff_marks[-1], "feed forward with steps", rows, ff_marks[-1], win))
+            save()
 
-        try:
-            good = {1: 0, 3: 0}
-            for j in ver:
-                idx, _ = loc.retrieve(loc.encode(image(j)), 3)
-                cv = [G.covisible(loc.K, ref[j]["pose"], loc.poses[i], ref[j]["points"], hw) >= float(ctx.get("covisible", 0.3)) for i in idx]
-                good[1] += int(cv[0])
-                good[3] += int(any(cv))
-            res["retrieval"] = dict(n=len(ver), top1=100.0 * good[1] / max(len(ver), 1), top3=100.0 * good[3] / max(len(ver), 1),
-                                    covisible=float(ctx.get("covisible", 0.3)))
-        except Exception as e:
-            res["notes"].append("retrieval check failed: %s: %s" % (type(e).__name__, e))
-        for k in sorted(set(int(x) for x in ctx["topk"])):
-            rows, win = pass_ff(loc, "reloc", k, [], ref, "relocalization, best %d map frames" % k)
-            res["reloc"].append(line("matching + PnP, best %d" % k, "feed forward", rows, 0, win))
-            if k == 1:
-                res["stages_reloc"] = stages(rows)
-        if ff_marks:
-            rows, win = pass_ff(loc, "reloc", 1, ff_marks[-1:], ref, "relocalization, matching and PnP with steps")
-            res["reloc"].append(line("matching + PnP, best 1 + %d steps" % ff_marks[-1], "feed forward with steps", rows, ff_marks[-1], win))
-        save()
+            def start_retrieved(j, known):
+                B.sync(dev)
+                a = time.time()
+                idx, _ = loc.retrieve(loc.encode(image(j)), 1)
+                B.sync(dev)
+                return loc.poses[idx[0]], time.time() - a, dict(idx=idx)
 
-        def start_retrieved(j, known):
-            B.sync(dev)
-            a = time.time()
-            idx, _ = loc.retrieve(loc.encode(image(j)), 1)
-            B.sync(dev)
-            return loc.poses[idx[0]], time.time() - a, dict(idx=idx)
-
-        rl_marks = [k for k in rc_marks if k <= int(ctx.get("reloc_rc_max", 100))] or rc_marks[:1]
-        rows, win = pass_rc(start_retrieved, rl_marks, ref, "relocalization, render and compare")
-        res["reloc"].append(line("pose of the best map frame", "prior", rows, 0, None))
-        for k in rl_marks:
-            res["reloc"].append(line("best frame, render and compare %d" % k, "render and compare", rows, k, win))
-        if ctx.get("loc_public") is not None:
-            try:
-                k = max(int(x) for x in ctx["topk"])
-                rows, win = pass_ff(ctx["loc_public"], "reloc", k, [], ref, "relocalization, public MASt3R")
-                res["reloc"].append(line("public MASt3R, matching + PnP, best %d" % k, "public", rows, 0, win))
-            except Exception as e:
-                res["notes"].append("public MASt3R relocalization failed: %s: %s" % (type(e).__name__, e))
-        res["reloc"] = [r for r in res["reloc"] if r]
-        save()
+            rl_marks = [k for k in rc_marks if k <= int(ctx.get("reloc_rc_max", 100))] or rc_marks[:1]
+            rows, win = pass_rc(start_retrieved, rl_marks, ref, "relocalization, render and compare")
+            res["reloc"].append(line("pose of the best map frame", "prior", rows, 0, None))
+            for k in rl_marks:
+                res["reloc"].append(line("best frame, render and compare %d" % k, "render and compare", rows, k, win))
+            if ctx.get("loc_public") is not None:
+                try:
+                    k = max(int(x) for x in ctx["topk"])
+                    rows, win = pass_ff(ctx["loc_public"], "reloc", k, [], ref, "relocalization, public MASt3R")
+                    res["reloc"].append(line("public MASt3R, matching + PnP, best %d" % k, "public", rows, 0, win))
+                except Exception as e:
+                    res["notes"].append("public MASt3R relocalization failed: %s: %s" % (type(e).__name__, e))
+            res["reloc"] = [r for r in res["reloc"] if r]
+            save()
 
         sel = [j for j in ver if nums[j] in centre] or ver
-        try:
-            if not sel:
-                raise RuntimeError("no verified frame")
-            conv = []
-            kf, kr = int(ctx.get("conv_ff_steps", 10)), int(ctx.get("conv_rc_steps", 100))
-            for li, (tp, rd) in enumerate(ctx.get("levels", LEVELS)):
-                rows = {"start": [], "ff": [], "ffk": [], "rc": []}
+        cap = int(ctx.get("conv_max", 12))
+        if len(sel) > cap:
+            sel = sel[::int(np.ceil(len(sel) / float(cap)))]
+        if "conv" in tasks:
+            try:
+                if not sel:
+                    raise RuntimeError("no verified frame")
+                conv = []
+                kf, kr = int(ctx.get("conv_ff_steps", 10)), int(ctx.get("conv_rc_steps", 100))
+                for li, (tp, rd) in enumerate(ctx.get("levels", LEVELS)):
+                    rows = {"start": [], "ff": [], "ffk": [], "rc": []}
+                    for j in sel:
+                        r = ref[j]
+                        s = G.perturb(r["pose"], tp / 100.0 * r["depth"], rd, np.random.default_rng(1000 * li + nums[j]))
+                        rows["start"].append(dict(ev={0: evaluate(j, s, ref)}))
+                        a = loc.localize(image(j), prior=s, topk=1)
+                        rows["ff"].append(dict(ev={0: evaluate(j, a["pose"], ref)}, ok=a["ok"]))
+                        if kf > 0:
+                            rows["ffk"].append(dict(ev={0: evaluate(j, steps_from(j, a["pose"], [kf])[0][kf], ref)}))
+                        if kr > 0:
+                            rows["rc"].append(dict(ev={0: evaluate(j, steps_from(j, s, [kr])[0][kr], ref)}))
+                    conv.append(dict(level=[tp, rd], n=len(sel), **{k: agg(v, 0, 0, px_tol) for k, v in rows.items() if v}))
+                    print("[proto] convergence from %.0f %% of depth and %.0f deg: within %.1f px of the reference after matching and PnP %.0f %%" % (
+                        tp, rd, px_tol, conv[-1]["ff"].get("sp", float("nan"))), flush=True)
+                res["convergence"] = dict(levels=conv, ff_steps=kf, rc_steps=kr, frames=len(sel))
+            except Exception as e:
+                res["notes"].append("convergence test failed: %s: %s" % (type(e).__name__, e))
+            save()
+
+        if "exact" in tasks:
+            try:
+                tp, rd = ctx.get("exact_level", (5.0, 2.0))
+                er = []
                 for j in sel:
                     r = ref[j]
-                    s = G.perturb(r["pose"], tp / 100.0 * r["depth"], rd, np.random.default_rng(1000 * li + nums[j]))
-                    rows["start"].append(dict(ev={0: evaluate(j, s, ref)}))
-                    a = loc.localize(image(j), prior=s, topk=1)
-                    rows["ff"].append(dict(ev={0: evaluate(j, a["pose"], ref)}, ok=a["ok"]))
-                    if kf > 0:
-                        rows["ffk"].append(dict(ev={0: evaluate(j, steps_from(j, a["pose"], [kf])[0][kf], ref)}))
-                    if kr > 0:
-                        rows["rc"].append(dict(ev={0: evaluate(j, steps_from(j, s, [kr])[0][kr], ref)}))
-                conv.append(dict(level=[tp, rd], n=len(sel), **{k: agg(v, 0, 0, px_tol) for k, v in rows.items() if v}))
-                print("[proto] convergence from %.0f %% of depth and %.0f deg: within %.1f px of the reference after matching and PnP %.0f %%" % (
-                    tp, rd, px_tol, conv[-1]["ff"].get("sp", float("nan"))), flush=True)
-            res["convergence"] = dict(levels=conv, ff_steps=kf, rc_steps=kr, frames=len(sel))
-        except Exception as e:
-            res["notes"].append("convergence test failed: %s: %s" % (type(e).__name__, e))
-        save()
-
-        try:
-            tp, rd = ctx.get("exact_level", (5.0, 2.0))
-            er = []
-            for j in sel:
-                r = ref[j]
-                true = G.perturb(r["pose"], tp / 100.0 * r["depth"], rd, np.random.default_rng(77 + nums[j]))
-                p = tens(true)
-                with torch.no_grad():
-                    img = ctx["render"](p, ctx["medium"](nums[j], p), t=nums[j] / fps).clamp(0.0, 1.0)
-                a = loc.localize(img, prior=r["pose"], topk=1)
-                er.append(list(G.pose_error(a["pose"], true, r["depth"])) + [G.pixel_shift(loc.K, true, a["pose"], r["points"], hw), float(a["ok"])])
-            er = np.asarray(er, dtype=np.float64)
-            if len(er):
-                res["exact"] = dict(n=len(er), level=[tp, rd], et=float(np.median(er[:, 0])), er=float(np.median(er[:, 1])),
-                                    px=float(np.nanmedian(er[:, 2])) if np.isfinite(er[:, 2]).any() else None,
-                                    sp=float(100.0 * np.mean(np.nan_to_num(er[:, 2], nan=np.inf) <= px_tol)), ok=float(100.0 * er[:, 3].mean()))
-        except Exception as e:
-            res["notes"].append("exact pose test failed: %s: %s" % (type(e).__name__, e))
+                    true = G.perturb(r["pose"], tp / 100.0 * r["depth"], rd, np.random.default_rng(77 + nums[j]))
+                    p = tens(true)
+                    with torch.no_grad():
+                        img = ctx["render"](p, ctx["medium"](nums[j], p), t=nums[j] / fps).clamp(0.0, 1.0)
+                    a = loc.localize(img, prior=r["pose"], topk=1)
+                    er.append(list(G.pose_error(a["pose"], true, r["depth"])) + [G.pixel_shift(loc.K, true, a["pose"], r["points"], hw), float(a["ok"])])
+                er = np.asarray(er, dtype=np.float64)
+                if len(er):
+                    res["exact"] = dict(n=len(er), level=[tp, rd], et=float(np.median(er[:, 0])), er=float(np.median(er[:, 1])),
+                                        px=float(np.nanmedian(er[:, 2])) if np.isfinite(er[:, 2]).any() else None,
+                                        sp=float(100.0 * np.mean(np.nan_to_num(er[:, 2], nan=np.inf) <= px_tol)), ok=float(100.0 * er[:, 3].mean()))
+            except Exception as e:
+                res["notes"].append("exact pose test failed: %s: %s" % (type(e).__name__, e))
 
     if not ctx.get("only_thinned"):
         passes()
     try:
-        if ctx.get("strides") or ctx.get("gaps"):
+        if "thinned" in tasks and (ctx.get("strides") or ctx.get("gaps")):
             res["sparse"] = thinned(ctx, loc, hw, px_tol, [dict(num=nums[j], img=(lambda j=j: image(j)), pose=ref[j]["pose"], depth=ref[j]["depth"],
                                                                points=ref[j]["points"], held=True) for j in ver])
     except Exception as e:
@@ -485,6 +516,24 @@ def thinned(ctx, loc, hw, px_tol, held):
     return out
 
 
+def difficulty(rows, px_tol):
+    use = [r for r in rows if r.get("gap") and "px" in r["ev"][0]]
+    if len(use) < 6:
+        return None
+    good = np.array([bool(np.isfinite(r["ev"][0]["px"]) and r["ev"][0]["px"] <= px_tol) for r in use])
+    out = dict(n=len(use), median={k: float(np.median([r["gap"][k] for r in use])) for k in ("t", "r", "seen")},
+               largest={k: float(np.max([r["gap"][k] for r in use])) for k in ("t", "r")})
+    for key in ("t", "r", "seen"):
+        v = np.array([r["gap"][key] for r in use])
+        e = np.quantile(v, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
+        bins = []
+        for i in range(3):
+            m = (v >= e[i]) & ((v <= e[i + 1]) if i == 2 else (v < e[i + 1]))
+            bins.append(dict(lo=float(e[i]), hi=float(e[i + 1]), n=int(m.sum()), sp=float(100.0 * good[m].mean()) if m.any() else None))
+        out[key] = bins
+    return out
+
+
 def fmt(v, spec):
     return "-" if v is None else spec % v
 
@@ -516,12 +565,20 @@ def report(res, info):
         L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization" % (
             info["mapping_seconds"], info["map_frames"], info["mapping_seconds"] / info["map_frames"]))
     r = res["reference"]
-    L += ["-" * W, " Reference   every held-out frame registered to the map offline with no time limit, no external reconstruction",
-          "             PnP on the matches to the %d map frames nearest in time, then %d render and compare steps" % (r["map_frames"], r["steps"]),
-          "             second run of %d steps from the interpolated pose as a check: verified %d of %d (the map points shift by at most %.1f px)" % (
-              r["check_steps"], r["verified"], r["frames"], r["tol"]),
-          "             the two runs differ by a median of %.2f %% of depth, %.2f deg, %s px (p90 %.2f %%, %.2f deg)" % (
-              r["check_median"][0], r["check_median"][1], fmt(r["check_median"][2], "%.1f"), r["check_p90"][0], r["check_p90"][1])]
+    if r.get("given"):
+        f = r.get("fit") or {}
+        L += ["-" * W, " Reference   poses of an offline mapping of all frames (the map frames and the queries together), no external reconstruction,",
+              "             moved into this map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ" % (
+                  f.get("n", 0), f.get("scale", float("nan"))),
+              "             by a median of %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), the floor of every pose error below. %d of %d queries have one." % (
+                  f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")), r["verified"], r["frames"])]
+    else:
+        L += ["-" * W, " Reference   every held-out frame registered to the map offline with no time limit, no external reconstruction",
+              "             PnP on the matches to the %d map frames nearest in time, then %d render and compare steps" % (r["map_frames"], r["steps"]),
+              "             second run of %d steps from the interpolated pose as a check: verified %d of %d (the map points shift by at most %.1f px)" % (
+                  r["check_steps"], r["verified"], r["frames"], r["tol"]),
+              "             the two runs differ by a median of %.2f %% of depth, %.2f deg, %s px (p90 %.2f %%, %.2f deg)" % (
+                  r["check_median"][0], r["check_median"][1], fmt(r["check_median"][2], "%.1f"), r["check_p90"][0], r["check_p90"][1])]
     if r.get("pnp_median"):
         L.append("             PnP against the reference: median %.2f %% of depth, %.2f deg, %s px (the floor of the PnP rows below)" % (
             r["pnp_median"][0], r["pnp_median"][1], fmt(r["pnp_median"][2], "%.1f")))
@@ -541,6 +598,13 @@ def report(res, info):
     if res["reloc"]:
         L.append(HEAD)
         L += [table_row(x) for x in res["reloc"]]
+    df = res.get("difficulty")
+    if df:
+        third = lambda key, spec: " | ".join((spec + " to " + spec + ": %s (%d)") % (b["lo"], b["hi"], fmt(b["sp"], "%.1f"), b["n"]) for b in df[key])
+        L += ["   the queries lie a median of %.1f %% of depth and %.1f deg from the nearest map frame (largest %.1f %%, %.1f deg), which sees %.0f %% of their view" % (
+            df["median"]["t"], df["median"]["r"], df["largest"]["t"], df["largest"]["r"], 100.0 * df["median"]["seen"]),
+              "   ok@px of matching + PnP, best 1, by thirds of the %d queries: distance in %% of depth  %s" % (df["n"], third("t", "%.1f")),
+              "       turn in deg  %s" % third("r", "%.1f"), "       share of the view seen  %s" % third("seen", "%.2f")]
     if res.get("stages_reloc"):
         s = res["stages_reloc"]
         L.append("   stages with one map frame: encoder %.0f ms | map frame choice %.1f ms | decoder and heads %.0f ms | matching %.0f ms | PnP %.0f ms" % (

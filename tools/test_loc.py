@@ -156,6 +156,7 @@ def main():
     assert res["reference"]["check_median"][2] < 0.6 and res["reference"]["pnp_median"][2] < 0.5, res["reference"]
     assert np.median(err[:, 0]) < 1.0 and np.median(err[:, 1]) < 0.5 and "%%" not in text, err
     row = lambda task, label: next(r for r in res[task] if r["label"] == label)
+    row_of = lambda rs, task, label: next(r for r in rs[task] if r["label"] == label)
     a, a0 = row("tracking", "matching + PnP"), row("tracking", "start pose, no computation")
     assert a["s5"] == 100.0 and a["sp"] == 100.0 and a["fails"] == 0 and a["px"] < 0.5 and a["px"] < 0.2 * a0["px"], (a, a0)
     b = row("reloc", "matching + PnP, best 3")
@@ -176,6 +177,26 @@ def main():
                                     public=False, mapping_seconds=None, weights_mb={"none": 0.0}, warmup=1))
     assert "Thinned map" in hard_text and "Tracking " not in hard_text
     print(hard_text[hard_text.index(" Thinned map"):hard_text.index(" Footprint")])
+    rng = np.random.default_rng(3)
+    sim = (1.7, G.rot(np.radians([20.0, -35.0, 50.0])), np.array([3.0, -2.0, 5.0]))
+    line = [np.eye(4) for _ in range(6)]
+    for i, q in enumerate(line):
+        q[:3, :3] = G.rot(np.radians(rng.normal(scale=3.0, size=3)))
+        q[:3, 3] = [0.3 * i, 0.0, 0.0]
+    moved = [G.move_pose(*sim, q) for q in line]
+    got, fit = G.transfer_poses(["f%d" % i for i in range(6)], np.array(line), ["f0", "f2", "f3", "f5"], np.array([moved[0], moved[2], moved[3], moved[5]]), ["f1", "f4"])
+    back = max(float(np.abs(got["f1"] - moved[1]).max()), float(np.abs(got["f4"] - moved[4]).max()))
+    print("poses moved between two reconstructions with camera centres on a line: scale %.4f, largest difference %.1e" % (fit["scale"], back))
+    assert abs(fit["scale"] - 1.7) < 1e-9 and back < 1e-9 and max(fit["et"]) < 1e-9 and max(fit["er"]) < 1e-5, (fit, back)
+    given = {name(i): truth[i] for i in test_nums}
+    out2 = tempfile.mkdtemp()
+    sp = P.run(dict(ctx, out_dir=out2, tasks=["reloc", "conv"], ref_poses=given,
+                    ref_fit=dict(n=len(map_nums), scale=1.0, t_med=0.0, t_max=0.0, r_med=0.0, r_max=0.0)))
+    sp_text = P.report(sp, dict(scene="synthetic scene", map_frames=len(map_nums), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in",
+                                public=False, mapping_seconds=None, weights_mb={"none": 0.0}, warmup=1))
+    print(sp_text[sp_text.index(" Reference"):sp_text.index(" Footprint")])
+    assert sp["reference"]["given"] and sp["reference"]["verified"] == len(tests) and not sp["tracking"] and "exact" not in sp and "sparse" not in sp, sp["reference"]
+    assert row_of(sp, "reloc", "matching + PnP, best 1")["sp"] >= 90.0 and sp["difficulty"]["n"] == len(tests) and "offline mapping of all frames" in sp_text
     print("test_loc ok")
 
 
