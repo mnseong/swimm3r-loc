@@ -17,6 +17,8 @@ frames that saw its direction, weighted by angle to their optical axis and dista
 
 import math
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 
@@ -76,8 +78,22 @@ class MediumField(nn.Module):
             out["beta_D_scale"] = self.beta_D_scale.clone()
         return out
 
+    def medium_live(self, c2w, focal, pp, h, w):
+        dirs = pixel_dirs(c2w.to(self.centre.dtype), float(focal), pp, h, w)
+        mp = self(dirs, c2w[:3, 3].to(self.centre.dtype).expand_as(dirs)).permute(2, 0, 1).contiguous()
+        out = dict(params_D=self.params_D, params_B=self.params_B, B_inf=mp.mean((1, 2)), B_inf_map=mp)
+        if self.has_scale:
+            out["beta_D_scale"] = self.beta_D_scale
+        return out
+
+    def trainable(self):
+        ps = list(self.mlp.parameters()) + [self.params_D, self.params_B]
+        for p in ps:
+            p.requires_grad_(True)
+        return ps
+
     def state(self):
-        return dict(cfg=self.cfg, state=self.state_dict(), has_scale=self.has_scale)
+        return dict(cfg=self.cfg, state={k: v.detach() for k, v in self.state_dict().items()}, has_scale=self.has_scale)
 
     @classmethod
     def from_state(cls, st):
@@ -85,6 +101,22 @@ class MediumField(nn.Module):
         m.load_state_dict(st["state"])
         m.has_scale = bool(st["has_scale"])
         return m
+
+
+def export_arrays(field, coupling):
+    """The field and the depth law of the physics head (coupling of training/physics_splat.attach_coupling) as plain arrays
+    with the prefix medium_, read by tools/viz/medium_np.py."""
+    st = field.state()
+    lin = [m for m in field.mlp if isinstance(m, nn.Linear)]
+    out = {"medium_w%d" % i: m.weight.detach().float().cpu().numpy() for i, m in enumerate(lin)}
+    out.update({"medium_b%d" % i: m.bias.detach().float().cpu().numpy() for i, m in enumerate(lin)})
+    for k in ("centre", "radius", "params_D", "params_B", "binf_mean", "beta_D_scale"):
+        out["medium_" + k] = st["state"][k].detach().float().cpu().numpy()
+    out["medium_freq"] = np.int32([st["cfg"]["dir_freq"], st["cfg"]["pos_freq"]])
+    out["medium_has_scale"] = np.bool_(st["has_scale"])
+    out["medium_law"] = np.array([float(coupling["jerlov"]), float(coupling["seathru"]), float(coupling["le"]), float(coupling["beta_max"]),
+                                  float(coupling["z_min"]), float(coupling["z_max"])], dtype=np.float32)
+    return out
 
 
 class ViewMedium:

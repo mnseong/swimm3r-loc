@@ -43,7 +43,7 @@ from model.anchor_head import AnchorHead, ScaffoldHead, band_limit, build_anchor
 from model.splatt3r_head import Splatt3RHead, load_splatt3r  # noqa: E402
 from training.gaussian_branch import NEAR_UNITS, quat_mul, render_view, render_view_beta, rotmat_to_quat, voxel_fuse  # noqa: E402
 from training.primitives4d import EPS2D_BETA4, K_BETA4, frame_gaps  # noqa: E402
-from training.physics_splat import background, invert, load_physics, medium, underwater_colours  # noqa: E402
+from training.physics_splat import background, invert, load_physics, medium, underwater_colours, water_terms  # noqa: E402
 from training import medium_raster as MR  # noqa: E402
 
 
@@ -99,6 +99,31 @@ def stage1_restored(scene_dir, names, h, w, dev):
     return out
 
 
+def map_stats(g, c2w, fnums, fps, focal):
+    """Water left in the in air colour (its blue green share by the distance to the camera that saw a slot) and the
+    shares of far and of faint wide slots."""
+    if "t_src" not in g or g["xyz"].shape[0] < 100:
+        return None
+    t_cam = torch.tensor([x / float(fps) for x in fnums], device=g["xyz"].device, dtype=torch.float32)
+    src = (g["t_src"].float().reshape(-1, 1) - t_cam[None]).abs().argmin(1)
+    cam = c2w[src]
+    z = ((g["xyz"].float() - cam[:, :3, 3]) * cam[:, :3, 2]).sum(-1)
+    J = g["J"].float()
+    q = torch.quantile(z[:: max(1, z.numel() // 200000)], torch.tensor([0.25, 0.5, 0.75], device=z.device))
+    edges = [z.min() - 1.0] + [x for x in q] + [z.max() + 1.0]
+    ratio = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (z > a) & (z <= b)
+        j = J[m].mean(0) if bool(m.any()) else J.new_zeros(3)
+        ratio.append(float(0.5 * (j[1] + j[2]) / j[0].clamp_min(1e-3)))
+    fp = z.clamp_min(1e-3) / float(focal)
+    big = (g["scales"].float() / g["unit"]).max(-1).values / fp
+    faint = (g["opacity"].float().reshape(-1) < 0.1) & (big > 4.0)
+    par = g["slot"].reshape(-1) == 0 if "slot" in g else torch.zeros_like(faint)
+    return dict(gb_over_r=ratio, far_share=float((z > 2.0 * z.median()).float().mean()), faint_wide=float(faint.float().mean()),
+                faint_wide_parent=float(faint[par].float().mean()) if bool(par.any()) else 0.0, quarter_edges=[float(x) for x in q])
+
+
 def main():
     ap = argparse.ArgumentParser(description="Splatt3R Gaussian map of a Stage 1 output with the physics coupling")
     ap.add_argument("--scene_dir", required=True)
@@ -134,6 +159,9 @@ def main():
                          "built from that frame alone, both with the frame's own medium, PSNR on all pixels, on the pixels the "
                          "map covers (alpha > 0.5) and on the rest, the share of the squared error in uncovered pixels, the fused "
                          "map with the medium of the two nearest other frames, and the water alone (B_inf, no Gaussians)")
+    ap.add_argument("--no_clean_depth", action="store_true",
+                    help="read the Stage 1 depth without MASt3R's cleaning, which sets the confidence of every point in front of the "
+                         "depth of another view to 0, so every pixel keeps its own confidence for the filter")
     ap.add_argument("--no_parent", action="store_true",
                     help="probe on a trained scaffold head: the parent Gaussians are left out of the map")
     ap.add_argument("--detail", type=float, nargs=2, default=None, metavar=("S", "FRAC"),
@@ -266,8 +294,10 @@ def main():
     dev = torch.device(args.device)
     t0 = time.time()
 
-    sc = E.load_scene(args.scene_dir, dev)
+    sc = E.load_scene(args.scene_dir, dev, clean_depth=not args.no_clean_depth)
     names, imgs, depth, conf, intr, c2w = sc["names"], sc["imgs"], sc["depth"], sc["conf"], sc["intr"], sc["c2w"]
+    print(f"[s3r] Stage 1 depth {'without' if args.no_clean_depth else 'with'} the cleaning of points in front of other views, "
+          f"confidence exactly 0 for {float((conf <= 0).float().mean()):.3f} of the pixels", flush=True)
     held_ref, held_info = None, None
     if args.map_holdout:
         hold = set(json.load(open(args.map_holdout))["test_files"])
@@ -333,6 +363,9 @@ def main():
         ap.error("--head or --splatt3r_ckpt")
     phys = load_physics(args.physics, dev, betaB_le_betaD=True)
     print(f"[s3r] {n} Stage 1 frames at {h}x{w} | head {src} | physics {phys.coupling}", flush=True)
+    observed = anchor is not None and getattr(anchor, "opt", {}).get("colour_base", "restored") == "observed"
+    if observed and args.phys_beta_D_scale is not None:
+        ap.error("this head was trained on the water of the physics head as it is: no --phys_beta_D_scale")
 
     with torch.no_grad():
         if anchor is not None:
@@ -341,13 +374,20 @@ def main():
             raw, zpass, feat = frame_passes(net, head, imgs)
         act = Splatt3RHead.activate(raw)
         med = medium(phys, feat, depth, beta_D_scale=args.phys_beta_D_scale)
-        J = invert(phys, imgs, depth, med)
-        s1 = stage1_restored(args.scene_dir, names, h, w, dev)
-        n_s1 = sum(1 for x in s1 if x is not None)
-        for i, x in enumerate(s1):
-            if x is not None:
-                J[i] = x
-        print(f"[s3r] restored colour: Stage 1 descattered frames for {n_s1}/{n}, inversion for the rest", flush=True)
+        wt, n_s1 = None, 0
+        if observed:
+            J = imgs.clone()
+            wt = water_terms(med, depth)
+            print("[s3r] colour: the head's own in air colour from the observed frames and the water of the physics head in front of every pixel; "
+                  "no inversion, the descattered frames of Stage 1 are not read", flush=True)
+        else:
+            J = invert(phys, imgs, depth, med)
+            s1 = stage1_restored(args.scene_dir, names, h, w, dev)
+            n_s1 = sum(1 for x in s1 if x is not None)
+            for i, x in enumerate(s1):
+                if x is not None:
+                    J[i] = x
+            print(f"[s3r] restored colour: Stage 1 descattered frames for {n_s1}/{n}, inversion for the rest", flush=True)
         # units of the pass to the Stage 1 units
         ok = (depth > 1e-4) & (zpass > 1e-4)
         ratio = torch.stack([(depth[i][ok[i]] / zpass[i][ok[i]]).median() for i in range(n)])
@@ -378,7 +418,7 @@ def main():
         zs = depth[depth > 1e-4]
         unit = NEAR_UNITS / torch.quantile(zs[:: max(1, zs.numel() // 200000)], 0.01).clamp_min(1e-4)
         if anchor is not None:
-            pa = {k: [] for k in ("xyz", "fp", "conf", "cam", "camx", "nrm", "vid", "feat", "J", "raw", "t")}
+            pa = {k: [] for k in ("xyz", "fp", "conf", "cam", "camx", "nrm", "vid", "feat", "J", "raw", "t") + (("med",) if observed else ())}
             pf = {k: [] for k in pa}
             tf = torch.tensor([E.fnum(x) / args.fps for x in names], device=dev, dtype=torch.float32)
             for i in range(n):
@@ -399,6 +439,8 @@ def main():
                 pa["J"].append(J[i].permute(1, 2, 0)[good])
                 pa["raw"].append(imgs[i].permute(1, 2, 0)[good])
                 pa["t"].append(tf[i].expand(k))
+                if observed:
+                    pa["med"].append(wt[i].permute(1, 2, 0)[good])
                 if args.far_layer:
                     far = torch.isfinite(xyz0).all(-1) & (z > 1e-4) & ~good
                     kf = int(far.sum())
@@ -406,6 +448,8 @@ def main():
                                        nrm=nrm[far], vid=torch.full((kf,), i, device=dev, dtype=torch.long), feat=featpx[i][far],
                                        J=J[i].permute(1, 2, 0)[far], raw=imgs[i].permute(1, 2, 0)[far], t=tf[i].expand(kf)).items():
                         pf[k_].append(v_)
+                    if observed:
+                        pf["med"].append(wt[i].permute(1, 2, 0)[far])
             del featpx
             pa_single = {i: {k: pa[k][i] for k in pa} for i in diag_idx}
             pa = {k: torch.cat(vv) for k, vv in pa.items()}
@@ -417,7 +461,7 @@ def main():
                                    cells=int(getattr(anchor, "cells", 2)),
                                    times=p["t"] if getattr(anchor, "cfg", {}).get("four_d") else None,
                                    detail=int(getattr(anchor, "cfg", {}).get("detail", 0)),
-                                   detail_frac=float(getattr(anchor, "cfg", {}).get("detail_frac", 0.0)))
+                                   detail_frac=float(getattr(anchor, "cfg", {}).get("detail_frac", 0.0)), med=p.get("med"))
                 o_ = anchor(a_)
                 gm = dict(xyz=o_["means"], means=o_["means"] * unit, scales=o_["scales"] * unit, quat=o_["quat"], opacity=o_["opacity"],
                           J=o_["J"], raw=o_["raw"], unit=unit, n_in=int(p["xyz"].shape[0]), n_out=o_["means"].shape[0])
@@ -723,7 +767,7 @@ def main():
 
     out = {"scene": args.scene_dir, "head": src, "lora": args.lora, "physics": args.physics, "frames_in_map": n,
            "primitives_before_fusion": n_in, "primitives": g["n_out"], "seconds_map": t_map, "stage1_restored_frames": n_s1,
-           "beta_D_scale": args.phys_beta_D_scale, "medium": modes, "medium_primary": modes[0], "medium_field": medium_info, "far_layer": int(g_far["n_out"]) if g_far is not None else 0,
+           "beta_D_scale": args.phys_beta_D_scale, "clean_depth": not args.no_clean_depth, "medium": modes, "medium_primary": modes[0], "medium_field": medium_info, "far_layer": int(g_far["n_out"]) if g_far is not None else 0,
            "medium_raster": args.medium_raster if "beta" in g else "preshade",
            "time_fill": bool(args.time_fill and tmaps),
            "time_bucket": ({"frames": int(args.time_bucket), "windows": len(tmaps), "primitives_all_windows": int(sum(m_["n_out"] for _, m_ in tmaps)),
@@ -740,7 +784,7 @@ def main():
                 m1 = medium_for(mode, fnums[i], c2w[i], fi, ci)
                 ti_ = fnums[i] / args.fps
                 own.append(score(render(c2w[i], m1, fi, ci, t=ti_), imgs[i]))
-                if mode == modes[0]:
+                if mode == modes[0] and not observed:
                     own_r.append(score(render(c2w[i], m1, fi, ci, which="restored", t=ti_), J[i]))
             out["map_frames_underwater" + sfx[mode]] = np.mean(own, 0).tolist()
             if own_r:
@@ -907,16 +951,28 @@ def main():
               f"through {gt_['auc_see_through']['mean']:.3f}, colour change {gt_['auc_colour']['mean']:.3f} | held out PSNR on "
               f"{len(refined)} frames: map gate {gt_['psnr']['map']}, shuffled inside a kind {gt_['psnr']['shuffled']}, gate 0 {gt_['psnr']['zero']}",
               flush=True)
+    with torch.no_grad():
+        ms = map_stats(g, c2w, fnums, args.fps, focal)
+    if ms:
+        out["map_stats"] = ms
+        print("[map stats] in air colour by the distance to the nearest map camera in time, quarters near to far, (G+B)/2 over R: %s (flat when no "
+              "water is left in it) | slots farther than twice the median distance %.3f | faint wide slots (opacity < 0.1, largest axis > 4 pixel "
+              "footprints) %.3f of the slots, %.3f of the parent slots" % (" / ".join("%.2f" % x for x in ms["gb_over_r"]), ms["far_share"],
+                                                                             ms["faint_wide"], ms["faint_wide_parent"]), flush=True)
     u8 = lambda c: (c.clamp(0, 1) * 255).round().byte().cpu().numpy()
     extra = {k: g[k].detach().float().cpu().numpy() for k in ("beta", "gate", "tw", "tb", "vel", "t_src") if k in g}
     if "slot" in g:
         extra["slot"] = g["slot"].cpu().numpy().astype(np.int16)
+    if field is not None:
+        from model.medium_field import export_arrays
+        extra.update(export_arrays(field, phys.coupling))
     np.savez_compressed(os.path.join(args.out_dir, "map.npz"), xyz=g["xyz"].float().cpu().numpy(),
                         scales=(g["scales"] / unit).half().cpu().numpy(), quat=g["quat"].half().cpu().numpy(),
-                        opacity=g["opacity"].reshape(-1).half().cpu().numpy(), color_raw=u8(g["raw"]), color_clean=u8(g["J"]),
+                        opacity=g["opacity"].reshape(-1).half().cpu().numpy(), color_clean=u8(g["J"]),
                         kf_c2w=c2w.cpu().numpy(), frame_c2w=c2w.cpu().numpy(), focal=np.float32(focal), pp=np.float32(pp),
-                        hw=np.int32([h, w]), kernel="beta" if "beta" in g else "gauss", restored="swimm3r_stage1", **extra)
-    text = None
+                        hw=np.int32([h, w]), kernel="beta" if "beta" in g else "gauss",
+                        restored="head_observed" if observed else "swimm3r_stage1", **extra)
+    text, gshort = None, None
     if (args.proto or args.gscpe) and args.data_dir:
         import bench_proto
         import loc_ff
@@ -1012,11 +1068,14 @@ def main():
             gtext = bench_gscpe.report(gres, dict(
                 scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
                 mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,
-                mapping_frames=n + (held_info["queries"] if held_info else 0),
+                mapping_frames=n + (held_info["queries"] if held_info else 0), map_seconds=t_map,
                 split="test : train = 1 : %.1f" % (n / max(len(tests), 1)))) + tail
             open(os.path.join(args.out_dir, "gscpe.txt"), "w").write(gtext + "\n")
             out["gscpe"] = gres
             text = gtext if text is None else text + "\n" + gtext
+            gshort = "\n".join(["=" * bench_gscpe.W] + bench_gscpe.in_short(gres, dict(
+                map_frames=n, mapping_seconds=args.bench_mapping_seconds, map_seconds=t_map,
+                mapping_frames=n + (held_info["queries"] if held_info else 0))) + ["=" * bench_gscpe.W])
     elif args.bench and args.data_dir:
         import bench_loc
         tests = sorted(json.load(open(args.split_json or os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)
@@ -1050,6 +1109,8 @@ def main():
     print(f"[done] {args.out_dir}/scores.json and map.npz in {out['seconds_total']:.0f}s", flush=True)
     if text:
         print(text, flush=True)
+    if gshort:
+        print("\n" + gshort, flush=True)
 
 
 if __name__ == "__main__":

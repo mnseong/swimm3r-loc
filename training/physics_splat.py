@@ -159,6 +159,14 @@ def invert(phys, img01, z, med):
     return j.clamp(0.0, 1.0)
 
 
+def water_terms(med, z):
+    """Water in front of every pixel (B, 6, H, W) of the media med (from medium(), one per view) at the depths z (B, H, W): the
+    direct transmission exp(-beta_D z) and the backscatter B_inf (1 - exp(-beta_B z)), three channels each."""
+    zz = z[:, None]
+    binf = med["B_inf_map"] if "B_inf_map" in med else med["B_inf"][:, :, None, None]
+    return torch.cat([torch.exp(-med["beta_D"] * zz), binf * (1.0 - torch.exp(-med["beta_B"] * zz))], dim=1)
+
+
 def select(med, idx):
     """The media of the views idx (a batch of views kept)."""
     out = {k: med[k][idx] for k in ("beta_D", "beta_B", "B_inf", "B_inf_map", "params_D", "params_B") if k in med}
@@ -230,6 +238,20 @@ def veil_terms(phys, med1, alpha, j_pre, z_surf, z_ref):
     td_s, w_s = tw(z_surf)
     td_r, w_r = tw(z_ref)
     return dict(known=j_pre * td_s, gain=a * w_s + (1.0 - a) * w_r, slack=(1.0 - a) * td_r, veil_surface=w_s, veil_reference=w_r)
+
+
+def rendered_depth_loss(depth, alpha, gt, mask, min_alpha=0.5, min_pixels=200):
+    terms = []
+    for i in range(depth.shape[0]):
+        m = mask[i] & (gt[i] > 0) & (alpha[i].detach() > min_alpha) & torch.isfinite(depth[i]) & (depth[i].detach() > 1e-6)
+        if int(m.sum()) < min_pixels:
+            continue
+        d, t = depth[i][m], gt[i][m]
+        s = (t / d.detach()).median()
+        terms.append(((d * s - t).abs() / t).mean())
+    if not terms:
+        return depth.sum() * 0.0, 0
+    return torch.stack(terms).mean(), len(terms)
 
 
 def veil_loss(med, raw, z):

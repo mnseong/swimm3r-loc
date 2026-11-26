@@ -407,6 +407,31 @@ def table(rows, key_t, key_acc, unit):
     return out
 
 
+KEY_ROWS = ("no render: match the map frame, PnP", "coarse: render, match, PnP", "refine: + masked warping", "fast: tokens, PnP, direct alignment",
+            "fast + check (decoder when it fails)", "fast + check, half precision", "anchors: map tokens in 3D, alignment",
+            "anchors + check (decoder if it fails)", "anchors + check, half precision")
+
+
+def in_short(res, info):
+    L = []
+    mf = int(info.get("mapping_frames") or info["map_frames"])
+    ms, gm = info.get("mapping_seconds"), info.get("map_seconds")
+    if ms:
+        tot = float(ms) + float(gm or 0.0)
+        L.append(" In short    mapping, run once: %d frames in %.0f s, %.1f s per frame (Stage 1 %.0f s, Gaussian map and medium field %s)" % (
+            mf, tot, tot / mf, float(ms), "%.0f s" % gm if gm is not None else "not timed"))
+    L.append(" %s localization of one query: seconds (FPS) | queries within 2 %% and 2 deg, within 5 %% and 5 deg | median error %% of depth, deg"
+             " | flow px (no reference)" % ("           " if ms else "In short   "))
+    by = {r["label"]: r for r in res["rows"]}
+    for lab in KEY_ROWS:
+        r = by.get(lab)
+        if r is None or r.get("acc") is None or r.get("s_mean") is None:
+            continue
+        L.append("               %-38s %5.2f s (%s FPS) | %5.1f %%  %5.1f %% | %5.2f %%  %5.2f deg | %s" % (
+            lab, r["s_mean"], fmt(r.get("fps"), "%4.2f"), r["acc"][2], r["acc"][1], r["t"], r["r"], fmt(r.get("flow"), "%.1f")))
+    return L
+
+
 def report(res, info):
     L = ["=" * W, " Swimm3R localization, protocol of GS-CPE (arXiv 2608.10938): split, pipeline, metrics and pseudo ground truth", "-" * W]
     d = res["device"]
@@ -425,6 +450,7 @@ def report(res, info):
         L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization%s" % (
             info["mapping_seconds"], mf, info["mapping_seconds"] / mf,
             "; the poses of the queries come from this same reconstruction" if mf != info["map_frames"] else ""))
+    L += ["-" * W] + in_short(res, info)
     L += ["-" * W] + R.reference_lines(res.get("fit"), info.get("reference"), res.get("skipped"))
     rc = res.get("reference_check") or {}
     if rc.get("n"):

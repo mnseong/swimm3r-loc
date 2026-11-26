@@ -81,7 +81,7 @@ def _frames(nsum, view, xsum):
 
 
 def build_anchors(xyz, fp, conf, cam, camx, nrm, vid, feat, J, raw, anchor_px, quadrants=False, cells=2, times=None, detail=0,
-                  detail_frac=0.0):
+                  detail_frac=0.0, med=None):
     """Anchors of the lifted pixels. xyz (N, 3) points, fp (N) footprints (depth / focal), conf (N) confidence on
     the Stage 1 scale, cam and camx (N, 3) centre and x axis of the camera of the pixel, nrm (N, 3) pixel normal
     (zero where none), vid (N) view index, feat (N, C), J and raw (N, 3) restored and underwater colours. Features
@@ -143,6 +143,8 @@ def build_anchors(xyz, fp, conf, cam, camx, nrm, vid, feat, J, raw, anchor_px, q
     jsd = (mean(J * J) - jm * jm).clamp_min(0.0).add(1e-8).sqrt()
     out = dict(centroid=centroid, edge=edge, frame=frame, var=var, view=view, count=count, views=views, density=density,
                nbr=nbr, feat=mean(feat), J=jm, J_sd=jsd, raw=mean(raw), n_pix=int(xyz.shape[0]))
+    if med is not None:
+        out["med"] = mean(med.detach())
     if times is not None:
         with torch.no_grad():
             out["t"] = mean(times.float()[:, None])[:, 0]
@@ -231,11 +233,18 @@ class _Block(nn.Module):
 
 
 class AnchorHead(nn.Module):
-    def __init__(self, feat_dim=FEAT_DIM, width=128, blocks=2, opacity_bias=2.0):
+    def __init__(self, feat_dim=FEAT_DIM, width=128, blocks=2, opacity_bias=2.0, med_in=0):
         super().__init__()
         in_dim = feat_dim + 3 + 3 + 3 + 1 + 1
         self.cfg = dict(feat_dim=feat_dim, width=width, blocks=blocks, opacity_bias=opacity_bias)
         self.inp = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, width), nn.GELU(), nn.Linear(width, width))
+        self.med = None
+        if int(med_in) > 0:
+            self.cfg["med_in"] = int(med_in)
+            self.med = nn.Linear(int(med_in), width)
+            with torch.no_grad():
+                self.med.weight.zero_()
+                self.med.bias.zero_()
         self.blocks = nn.ModuleList([_Block(width) for _ in range(blocks)])
         self.out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.GELU(), nn.Linear(width, N_OUT))
         last = self.out[-1]
@@ -251,6 +260,10 @@ class AnchorHead(nn.Module):
         cosv = (a["frame"][..., 2] * a["view"]).sum(-1, keepdim=True).abs()
         x = torch.cat([a["feat"].float(), a["J"], a["J_sd"], sd, cosv, a["density"][:, None]], dim=-1)
         f = self.inp(x)
+        if self.med is not None:
+            if "med" not in a:
+                raise ValueError("this head reads the water in front of every anchor: build_anchors(..., med=...)")
+            f = f + self.med(a["med"].to(f.dtype))
         for b in self.blocks:
             f = b(f, a["nbr"])
         return f, sd
@@ -385,8 +398,12 @@ class ScaffoldHead(nn.Module):
     def __init__(self, feat_dim=FEAT_DIM, width=128, blocks=2, opacity_bias=2.0, child_use_bias=-2.0, parent_use_bias=3.0,
                  parent_floor=0.35, child_floor=0.18, cells=2, beta=False, four_d=False, scaffold=True, always_on=False,
                  gate_init=0.0, beta_fixed=0.0, parent_slot=True, soft_clamp=False, detail=0, detail_frac=0.0, detail_floor=0.0,
-                 transient=0.0, parent_norm=False, band=0.0, pos_range=0.5, scale_cap=0.0, exist=0.0):
+                 transient=0.0, parent_norm=False, band=0.0, pos_range=0.5, scale_cap=0.0, exist=0.0, colour_base="restored", med_in=0):
         super().__init__()
+        if colour_base not in ("restored", "observed"):
+            raise ValueError(f"colour_base {colour_base} is neither restored nor observed")
+        if colour_base == "observed" and int(med_in) <= 0:
+            raise ValueError("an observed colour base needs the water of every anchor as input (med_in > 0)")
         if float(exist) < 0.0 or (float(exist) > 0.0 and (not four_d or float(transient) > 0.0)):
             raise ValueError("exist needs four_d and no transient")
         if float(scale_cap) < 0.0:
@@ -403,17 +420,18 @@ class ScaffoldHead(nn.Module):
             raise ValueError(f"beta_fixed {beta_fixed} below 0")
         if float(beta_fixed) > 0.0 and not beta:
             raise ValueError("beta_fixed needs beta (the Beta rasteriser)")
-        self.parent = AnchorHead(feat_dim=feat_dim, width=width, blocks=blocks, opacity_bias=opacity_bias)
+        self.parent = AnchorHead(feat_dim=feat_dim, width=width, blocks=blocks, opacity_bias=opacity_bias, med_in=med_in)
         self.cfg = dict(feat_dim=feat_dim, width=width, blocks=blocks, opacity_bias=opacity_bias, child_use_bias=child_use_bias,
                         parent_use_bias=parent_use_bias, parent_floor=parent_floor, child_floor=child_floor, cells=cells,
                         beta=bool(beta), four_d=bool(four_d), scaffold=True, always_on=bool(always_on), gate_init=float(gate_init),
                         beta_fixed=float(beta_fixed))
         new = dict(parent_slot=bool(parent_slot), soft_clamp=bool(soft_clamp), detail=int(detail), detail_frac=float(detail_frac),
                    detail_floor=float(detail_floor), transient=float(transient), parent_norm=bool(parent_norm), band=float(band),
-                   pos_range=float(pos_range), scale_cap=float(scale_cap), exist=float(exist))
+                   pos_range=float(pos_range), scale_cap=float(scale_cap), exist=float(exist), colour_base=str(colour_base), med_in=int(med_in))
         self.cfg.update({k: v for k, v in new.items() if v != dict(parent_slot=True, soft_clamp=False, detail=0, detail_frac=0.0,
                                                                   detail_floor=0.0, transient=0.0, parent_norm=False, band=0.0,
-                                                                  pos_range=0.5, scale_cap=0.0, exist=0.0)[k]})
+                                                                  pos_range=0.5, scale_cap=0.0, exist=0.0, colour_base="restored",
+                                                                  med_in=0)[k]})
         self.opt = new
         self.cells = int(cells)
         self.extra = N_X if (beta or four_d) else 0

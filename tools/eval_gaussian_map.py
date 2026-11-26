@@ -79,12 +79,13 @@ def interpolate_poses(poses, test_nums, train_nums):
     return np.asarray(out)
 
 
-def load_scene(scene_dir, dev):
-    """Frames, depth, confidence, intrinsics and poses of a Stage 1 output."""
+def load_scene(scene_dir, dev, clean_depth=True):
+    """Frames, depth, confidence, intrinsics and poses of a Stage 1 output. clean_depth sets the confidence of the
+    points that lie in front of the depth of another view to 0 (MASt3R's cleaning), without it every point keeps its own."""
     with open(os.path.join(scene_dir, "scene.pkl"), "rb") as f:
         scene = pickle.load(f)
     names = [os.path.basename(p) for p in scene.img_paths]
-    _, depthmaps, confs = scene.get_dense_pts3d(clean_depth=True)
+    _, depthmaps, confs = scene.get_dense_pts3d(clean_depth=bool(clean_depth))
     imgs = torch.stack([torch.from_numpy(np.asarray(im, dtype=np.float32)).permute(2, 0, 1) for im in scene.imgs]).to(dev)
     n, _, h, w = imgs.shape
     depth = torch.stack([d.detach().float().reshape(h, w) for d in depthmaps]).to(dev)

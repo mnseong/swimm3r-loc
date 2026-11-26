@@ -352,6 +352,7 @@ class GaussianBranch:
             jerlov_kwargs=jerlov_kwargs,
             jerlov_noise=float(getattr(args, "phys_jerlov_synth_noise", 0.0)),
             seed=seed + 7919,
+            gt_depth=float(getattr(args, "splatt3r_depth_weight", 0.0) or 0.0) > 0,
             **timed,
         )
         gen = torch.Generator()
