@@ -34,6 +34,9 @@ import torch.nn.functional as F
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from utils import cuda_linalg_cpu  # noqa: E402
+
+cuda_linalg_cpu.install()
 import mast3r.utils.path_to_dust3r  # noqa: E402,F401
 import eval_gaussian_map as E  # noqa: E402
 from model.anchor_head import AnchorHead, ScaffoldHead, band_limit, build_anchors, describe, pixel_normals, slot_at_time  # noqa: E402

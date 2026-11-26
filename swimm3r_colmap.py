@@ -46,6 +46,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from utils import cuda_linalg_cpu  # noqa: E402
+
+cuda_linalg_cpu.install()
 
 from inference.reconstruction import (
     load_model,
