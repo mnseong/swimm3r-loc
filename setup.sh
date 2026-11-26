@@ -18,3 +18,13 @@ import gsplat
 from gsplat.cuda._backend import _C
 assert _C is not None, 'the rasteriser did not load'
 print('setup ok (rasteriser)', gsplat.__version__, _C.__file__)"
+cd "$D/tools/csrc"
+rm -rf build water_gn_ext*.so
+python setup.py build_ext --inplace
+cd "$D"
+python -c "
+import sys
+sys.path.insert(0, 'tools/csrc')
+import torch
+import water_gn_ext
+print('setup ok (water aligned steps)', 'with CUDA' if water_gn_ext.has_cuda() else 'for the CPU only')"

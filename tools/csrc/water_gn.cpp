@@ -1,0 +1,234 @@
+#include <torch/extension.h>
+
+#include <cmath>
+#include <vector>
+
+#include "water_gn.h"
+
+#ifdef WITH_CUDA
+void wgn_pass_a_cuda(const WgnParams& p, const float* stack, const float* X, const float* Jv, const float* Bv, const float* bD, const float* bB,
+                     const float* z0, float* Y, float* q, float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums);
+void wgn_pass_b_cuda(const WgnParams& p, const float* Y, const float* q, const float* qx, const float* qy, const float* m, const float* dm,
+                     const unsigned char* use, const float* g, const float* sig, float huber_k, double* hb);
+#endif
+
+static void pass_a_cpu(const WgnParams& p, const float* stack, const float* X, const float* Jv, const float* Bv, const float* bD, const float* bB,
+                       const float* z0, float* Y, float* q, float* qx, float* qy, float* m, float* dm, unsigned char* use, double* sums) {
+  const int C = p.C, N = p.N;
+  const long HW = (long)p.H * p.W;
+  for (int i = 0; i < N; ++i) {
+    float u, v;
+    bool ok = wgn_project(p, X + 3 * i, Y + 3 * i, &u, &v);
+    use[i] = ok ? 1 : 0;
+    for (int c = 0; c < C; ++c) {
+      long k = (long)c * N + i;
+      if (!ok) {
+        q[k] = qx[k] = qy[k] = m[k] = dm[k] = 0.0f;
+        continue;
+      }
+      q[k] = wgn_bilinear(stack + c * HW, p.W, u, v);
+      qx[k] = wgn_bilinear(stack + (C + c) * HW, p.W, u, v);
+      qy[k] = wgn_bilinear(stack + (2 * C + c) * HW, p.W, u, v);
+      float zm = p.transport ? Y[3 * i + 2] : z0[i];
+      wgn_model(Jv[k], Bv[k], bD[k], bB[k], zm, p.transport, &m[k], &dm[k]);
+    }
+    if (ok) sums[0] += 1.0;
+  }
+}
+
+static void pass_b_cpu(const WgnParams& p, const float* Y, const float* q, const float* qx, const float* qy, const float* m, const float* dm,
+                       const unsigned char* use, const float* g, const float* sig, float huber_k, double* hb) {
+  const int C = p.C, N = p.N;
+  for (int i = 0; i < N; ++i) {
+    if (!use[i]) continue;
+    float acc[WGN_NSUM] = {0.0f};
+    for (int c = 0; c < C; ++c) {
+      long k = (long)c * N + i;
+      float r = g[c] * q[k] - m[k];
+      float w = wgn_weight(r, sig[0], huber_k);
+      float row[WGN_P];
+      wgn_row(p, Y + 3 * i, c, q[k], qx[k], qy[k], g[c], dm[k], row);
+      wgn_accumulate(row, w, r, acc);
+    }
+    for (int k = 0; k < WGN_NSUM; ++k) hb[k] += acc[k];
+  }
+}
+
+static void rodrigues(const double* w, double* R) {
+  double th = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+  double K[9] = {0.0, -w[2], w[1], w[2], 0.0, -w[0], -w[1], w[0], 0.0};
+  double K2[9];
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      double s = 0.0;
+      for (int l = 0; l < 3; ++l) s += K[3 * i + l] * K[3 * l + j];
+      K2[3 * i + j] = s;
+    }
+  double a = th < 1e-9 ? 1.0 : std::sin(th) / th;
+  double b = th < 1e-9 ? 0.0 : (1.0 - std::cos(th)) / (th * th);
+  for (int i = 0; i < 9; ++i) R[i] = (i % 4 == 0 ? 1.0 : 0.0) + a * K[i] + b * K2[i];
+}
+
+static bool solve_normal(const double* hb, double* x) {
+  const int P = WGN_P;
+  double A[WGN_P][WGN_P + 1];
+  int k = 0;
+  for (int i = 0; i < P; ++i)
+    for (int j = i; j < P; ++j) {
+      A[i][j] = hb[k];
+      A[j][i] = hb[k];
+      ++k;
+    }
+  double tr = 0.0;
+  for (int i = 0; i < P; ++i) tr += A[i][i];
+  for (int i = 0; i < P; ++i) {
+    A[i][i] += 1e-6 * tr / (double)P;
+    A[i][P] = -hb[45 + i];
+  }
+  for (int c = 0; c < P; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < P; ++r)
+      if (std::fabs(A[r][c]) > std::fabs(A[piv][c])) piv = r;
+    if (std::fabs(A[piv][c]) < 1e-300) return false;
+    if (piv != c)
+      for (int j = 0; j <= P; ++j) std::swap(A[c][j], A[piv][j]);
+    for (int r = c + 1; r < P; ++r) {
+      double f = A[r][c] / A[c][c];
+      for (int j = c; j <= P; ++j) A[r][j] -= f * A[c][j];
+    }
+  }
+  for (int i = P - 1; i >= 0; --i) {
+    double s = A[i][P];
+    for (int j = i + 1; j < P; ++j) s -= A[i][j] * x[j];
+    x[i] = s / A[i][i];
+  }
+  for (int i = 0; i < P; ++i)
+    if (!std::isfinite(x[i])) return false;
+  return true;
+}
+
+std::vector<torch::Tensor> align_level(torch::Tensor stack, torch::Tensor X, torch::Tensor Jv, torch::Tensor Bv, torch::Tensor bD, torch::Tensor bB,
+                                       torch::Tensor z0, torch::Tensor Rt, double fx, double fy, double cx, double cy, double scale, bool transport,
+                                       double huber_k, int64_t iters, double tol, int64_t min_use) {
+  TORCH_CHECK(stack.dim() == 3 && stack.size(0) % 3 == 0, "stack must be (3C, H, W)");
+  TORCH_CHECK(stack.scalar_type() == torch::kFloat32 && X.scalar_type() == torch::kFloat32, "float32 tensors expected");
+  TORCH_CHECK(stack.size(0) / 3 <= 3, "at most 3 colour channels");
+  const bool cuda = stack.is_cuda();
+#ifndef WITH_CUDA
+  TORCH_CHECK(!cuda, "water_gn_ext was built without CUDA");
+#endif
+  stack = stack.contiguous();
+  X = X.contiguous();
+  Jv = Jv.contiguous();
+  Bv = Bv.contiguous();
+  bD = bD.contiguous();
+  bB = bB.contiguous();
+  z0 = z0.contiguous();
+  WgnParams p;
+  p.C = (int)(stack.size(0) / 3);
+  p.H = (int)stack.size(1);
+  p.W = (int)stack.size(2);
+  p.N = (int)X.size(0);
+  p.fx = (float)fx;
+  p.fy = (float)fy;
+  p.cx = (float)cx;
+  p.cy = (float)cy;
+  p.scale = (float)scale;
+  p.transport = transport ? 1 : 0;
+  auto fo = stack.options();
+  auto Y = torch::zeros({p.N, 3}, fo);
+  auto q = torch::zeros({p.C, p.N}, fo), qx = torch::zeros({p.C, p.N}, fo), qy = torch::zeros({p.C, p.N}, fo);
+  auto m = torch::zeros({p.C, p.N}, fo), dm = torch::zeros({p.C, p.N}, fo);
+  auto use = torch::zeros({p.N}, fo.dtype(torch::kUInt8));
+  auto sums = torch::zeros({1}, fo.dtype(torch::kFloat64));
+  auto hb = torch::zeros({WGN_NSUM}, fo.dtype(torch::kFloat64));
+  auto rt = Rt.to(torch::kCPU, torch::kFloat64).contiguous();
+  double R[9], t[3];
+  TORCH_CHECK(rt.numel() == 15, "state must hold R (9), t (3) and the gains (3)");
+  double gh[3];
+  for (int i = 0; i < 9; ++i) R[i] = rt.data_ptr<double>()[i];
+  for (int i = 0; i < 3; ++i) t[i] = rt.data_ptr<double>()[9 + i];
+  for (int i = 0; i < 3; ++i) gh[i] = rt.data_ptr<double>()[12 + i];
+  int steps = 0, n_use = 0;
+  double last = -1.0;
+
+  for (int64_t it = 0; it < iters; ++it) {
+    for (int i = 0; i < 9; ++i) p.R[i] = (float)R[i];
+    for (int i = 0; i < 3; ++i) p.t[i] = (float)t[i];
+    sums.zero_();
+    hb.zero_();
+    if (cuda) {
+#ifdef WITH_CUDA
+      wgn_pass_a_cuda(p, stack.data_ptr<float>(), X.data_ptr<float>(), Jv.data_ptr<float>(), Bv.data_ptr<float>(), bD.data_ptr<float>(),
+                      bB.data_ptr<float>(), z0.data_ptr<float>(), Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(),
+                      m.data_ptr<float>(), dm.data_ptr<float>(), use.data_ptr<unsigned char>(), sums.data_ptr<double>());
+#endif
+    } else {
+      pass_a_cpu(p, stack.data_ptr<float>(), X.data_ptr<float>(), Jv.data_ptr<float>(), Bv.data_ptr<float>(), bD.data_ptr<float>(),
+                 bB.data_ptr<float>(), z0.data_ptr<float>(), Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(),
+                 m.data_ptr<float>(), dm.data_ptr<float>(), use.data_ptr<unsigned char>(), sums.data_ptr<double>());
+    }
+    auto g = torch::tensor({(float)gh[0], (float)gh[1], (float)gh[2]}, torch::dtype(torch::kFloat32)).narrow(0, 0, p.C).to(stack.device()).contiguous();
+    auto ub = use.to(torch::kBool).unsqueeze(0).expand({p.C, p.N});
+    auto r = torch::where(ub, g.unsqueeze(1) * q - m, torch::full_like(q, NAN));
+    auto med = r.nanmedian();
+    auto sig = (1.4826 * (r - med).abs().nanmedian() + 1e-6).to(torch::kFloat32).reshape({1}).contiguous();
+    if (cuda) {
+#ifdef WITH_CUDA
+      wgn_pass_b_cuda(p, Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(),
+                      dm.data_ptr<float>(), use.data_ptr<unsigned char>(), g.data_ptr<float>(), sig.data_ptr<float>(), (float)huber_k,
+                      hb.data_ptr<double>());
+#endif
+    } else {
+      pass_b_cpu(p, Y.data_ptr<float>(), q.data_ptr<float>(), qx.data_ptr<float>(), qy.data_ptr<float>(), m.data_ptr<float>(), dm.data_ptr<float>(),
+                 use.data_ptr<unsigned char>(), g.data_ptr<float>(), sig.data_ptr<float>(), (float)huber_k, hb.data_ptr<double>());
+    }
+    auto both = torch::cat({hb, sums}).to(torch::kCPU);
+    const double* hbh = both.data_ptr<double>();
+    n_use = (int)hbh[WGN_NSUM];
+    if (n_use < min_use) break;
+    double xi[WGN_P];
+    if (!solve_normal(hbh, xi)) break;
+    for (int c = 0; c < p.C; ++c) {
+      double gn = gh[c] + xi[6 + c];
+      gh[c] = gn < 0.25 ? 0.25 : (gn > 4.0 ? 4.0 : gn);
+    }
+    double Rw[9];
+    rodrigues(xi + 3, Rw);
+    double Rn[9], tn[3];
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        double s = 0.0;
+        for (int l = 0; l < 3; ++l) s += Rw[3 * i + l] * R[3 * l + j];
+        Rn[3 * i + j] = s;
+      }
+      tn[i] = Rw[3 * i] * t[0] + Rw[3 * i + 1] * t[1] + Rw[3 * i + 2] * t[2] + scale * xi[i];
+    }
+    for (int i = 0; i < 9; ++i) R[i] = Rn[i];
+    for (int i = 0; i < 3; ++i) t[i] = tn[i];
+    ++steps;
+    double nt = std::sqrt(xi[0] * xi[0] + xi[1] * xi[1] + xi[2] * xi[2]);
+    double nr = std::sqrt(xi[3] * xi[3] + xi[4] * xi[4] + xi[5] * xi[5]);
+    last = nt > nr ? nt : nr;
+    if (last < tol) break;
+  }
+  auto out = torch::zeros({15}, torch::dtype(torch::kFloat64));
+  for (int i = 0; i < 9; ++i) out.data_ptr<double>()[i] = R[i];
+  for (int i = 0; i < 3; ++i) out.data_ptr<double>()[9 + i] = t[i];
+  for (int i = 0; i < 3; ++i) out.data_ptr<double>()[12 + i] = gh[i];
+  auto info = torch::tensor({(double)steps, last, (double)n_use}, torch::dtype(torch::kFloat64));
+  return {out, info, q, m, use};
+}
+
+bool has_cuda() {
+#ifdef WITH_CUDA
+  return true;
+#else
+  return false;
+#endif
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
+  mod.def("align_level", &align_level, "Gauss Newton of one pyramid level, the water model inside the residual");
+  mod.def("has_cuda", &has_cuda, "built with the CUDA kernels");
+}

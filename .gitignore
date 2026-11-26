@@ -5,3 +5,4 @@ __pycache__/
 *.egg-info/
 ubs/submodules/build/
 .cache/
+tools/csrc/build/

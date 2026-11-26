@@ -295,7 +295,8 @@ def direct_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3),
     return out
 
 
-def localize_fast(loc, img, render_at, topk=2, thr_px=None, half=False, photo="lcn", levels=(3, 2, 1), iters=(5, 4, 3), anchors=None, guided=True, support=64):
+def localize_fast(loc, img, render_at, topk=2, thr_px=None, half=False, photo="lcn", levels=(3, 2, 1), iters=(5, 4, 3), anchors=None, guided=True, support=64,
+                  water=None, transport=True, backend="auto"):
     t = {}
     sync(loc.dev)
     a = time.time()
@@ -341,10 +342,20 @@ def localize_fast(loc, img, render_at, topk=2, thr_px=None, half=False, photo="l
         t["pnp"] += time.time() - a
     coarse = np.asarray(sol["c2w"], dtype=np.float64) if coarse_ok else np.asarray(start, dtype=np.float64)
     inl = int(sol["inliers"]) if coarse_ok else 0
-    al = direct_align(img, coarse, loc.K, lambda p: render_at(p, idx[0]), levels=levels, iters=iters, photo=photo, sync_fn=lambda: sync(loc.dev))
+    if water is not None:
+        import loc_water as LW
+        sync(loc.dev)
+        a = time.time()
+        with torch.no_grad():
+            parts = water(coarse, idx[0])
+        sync(loc.dev)
+        al = LW.water_align(img, coarse, loc.K, parts, levels=levels, iters=iters, transport=transport, backend=backend, sync_fn=lambda: sync(loc.dev),
+                            render_seconds=time.time() - a)
+    else:
+        al = direct_align(img, coarse, loc.K, lambda p: render_at(p, idx[0]), levels=levels, iters=iters, photo=photo, sync_fn=lambda: sync(loc.dev))
     t["render"], t["align"] = al["stages"]["render"], al["stages"]["align"]
     return dict(ok=bool(coarse_ok and al["ok"]), pose=al["pose"], coarse=coarse, idx=list(idx), matches=int(len(p2d)), mutual=int(n_mutual), inliers=inl,
-                first=n_first, seen=int(n_seen), agree=int(n_agree), densified=bool(densified),
+                first=n_first, seen=int(n_seen), agree=int(n_agree), densified=bool(densified), backend=al.get("backend", "torch"),
                 corr=al["corr"], valid=al["valid"], steps=al["steps"], shift=al["shift"], stages=t, seconds=float(sum(t.values())), fq=fq)
 
 

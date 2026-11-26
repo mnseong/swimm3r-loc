@@ -335,7 +335,7 @@ def run(ctx):
                                      densified=mean(lambda x: 100.0 * float(x.get("densified", False))),
                                      corr=float(np.median([x["corr"] for x in use if x["corr"] is not None])) if any(x["corr"] is not None for x in use) else None,
                                      valid=mean(lambda x: x["valid"]), fallback=mean(lambda x: 100.0 * float(x.get("fallback", False))))
-                    info[keep] = dict(stages=st, **extra)
+                    info[keep] = dict(stages=st, backend=use[0].get("backend"), **extra)
             except Exception as e:
                 res["notes"].append("%s failed: %s: %s" % (label, type(e).__name__, e))
 
@@ -363,6 +363,24 @@ def run(ctx):
                 timed("anchors, render without the water", "anchor", lambda im: LF.localize_fast(loc, im, at("restored"), anchors=anchors, **ak))
                 if low is not None:
                     timed("anchors in %d dimensions" % low.dim, "anchor", lambda im: LF.localize_fast(loc, im, at("underwater"), anchors=low, **ak), "anchor_low")
+            wat = ctx.get("water")
+            if wat is not None:
+                import loc_water as LW
+                wf = lambda p, i: wat(p, map_nums[i])
+                wk = dict(levels=tuple(ctx.get("water_levels", fk["levels"])), iters=tuple(ctx.get("water_iters", fk["iters"])), support=ak["support"])
+                info["water_cfg"] = dict(ext=bool(LW.self_check(dev)), levels=list(wk["levels"]), iters=list(wk["iters"]))
+                timed("anchors: water aligned", "water", lambda im: LF.localize_fast(loc, im, None, anchors=anchors, water=wf, **wk), "water")
+                timed("anchors + check: water aligned", "water", lambda im: LF.localize_tiered(loc, im, None, check=chk, anchors=anchors, water=wf, **wk),
+                      "water_tiered")
+                if half:
+                    timed("anchors + check, water, half prec.", "water",
+                          lambda im: LF.localize_tiered(loc, im, None, check=chk, half=True, anchors=anchors, water=wf, **wk), "water_tiered_half")
+                if ctx.get("ablation", True):
+                    timed("anchors: water aligned, frozen water", "water",
+                          lambda im: LF.localize_fast(loc, im, None, anchors=anchors, water=wf, transport=False, **wk), "water_frozen")
+                    if info["water_cfg"]["ext"]:
+                        timed("anchors: water aligned, PyTorch steps", "water",
+                              lambda im: LF.localize_fast(loc, im, None, anchors=anchors, water=wf, backend="torch", **wk), "water_torch")
             if ctx.get("loc_public") is not None:
                 try:
                     pub_anchors = LF.TokenAnchors(ctx["loc_public"], cell=anchors.cell)
@@ -409,7 +427,8 @@ def table(rows, key_t, key_acc, unit):
 
 KEY_ROWS = ("no render: match the map frame, PnP", "coarse: render, match, PnP", "refine: + masked warping", "fast: tokens, PnP, direct alignment",
             "fast + check (decoder when it fails)", "fast + check, half precision", "anchors: map tokens in 3D, alignment",
-            "anchors + check (decoder if it fails)", "anchors + check, half precision")
+            "anchors + check (decoder if it fails)", "anchors + check, half precision", "anchors: water aligned", "anchors + check: water aligned",
+            "anchors + check, water, half prec.")
 
 
 def in_short(res, info):
@@ -518,8 +537,19 @@ def report(res, info):
             if an.get("low_dim"):
                 L.append("   In %d dimensions (principal directions of the anchors, %.0f %% of the energy) the anchors take %.1f MB." % (
                     an["low_dim"], 100.0 * an["low_kept"], an["low_mb"]))
+        wa = fa.get("water_cfg")
+        if wa:
+            L += ["   Water aligned: one render of the in air colour, depth and opacity of the map at the PnP pose (half resolution when the levels allow it),",
+                  "   then Gauss-Newton on the query against J exp(-beta_D z) + B_inf (1 - exp(-beta_B z)) with z the depth of every point in the moved camera,",
+                  "   so the attenuation and the veil change with the pose inside the solve (frozen water: the water of the start depth, as a fixed render). One",
+                  "   gain per colour channel. Levels 1/%s, %s steps. Steps of a level run %s." % (
+                      ", 1/".join(str(2 ** int(x)) for x in wa["levels"]), "/".join(str(x) for x in wa["iters"]),
+                      "in the C++ extension (tools/csrc, one loop per level, two kernels and one copy to the host per step)" if wa["ext"] else
+                      "in PyTorch (the C++ extension is not built or did not match on this device)")]
         for key, name in (("anchor", "anchors"), ("anchor_tiered", "anchors + check"), ("anchor_tiered_half", "anchors + check, half prec."),
-                          ("anchor_low", "anchors, fewer dimensions")):
+                          ("anchor_low", "anchors, fewer dimensions"), ("water", "water aligned"), ("water_tiered", "water aligned + check"),
+                          ("water_tiered_half", "water + check, half prec."), ("water_frozen", "water aligned, frozen water"),
+                          ("water_torch", "water aligned, PyTorch steps")):
             d = fa.get(key)
             if not d:
                 continue

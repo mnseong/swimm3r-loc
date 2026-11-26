@@ -43,7 +43,7 @@ from model.anchor_head import AnchorHead, ScaffoldHead, band_limit, build_anchor
 from model.splatt3r_head import Splatt3RHead, load_splatt3r  # noqa: E402
 from training.gaussian_branch import NEAR_UNITS, quat_mul, render_view, render_view_beta, rotmat_to_quat, voxel_fuse  # noqa: E402
 from training.primitives4d import EPS2D_BETA4, K_BETA4, frame_gaps  # noqa: E402
-from training.physics_splat import background, invert, load_physics, medium, underwater_colours, water_terms  # noqa: E402
+from training.physics_splat import background, beta_at, invert, load_physics, medium, underwater_colours, water_terms  # noqa: E402
 from training import medium_raster as MR  # noqa: E402
 
 
@@ -267,6 +267,8 @@ def main():
     ap.add_argument("--fast_cell", type=float, default=0.25,
                     help="--gscpe fast path: tokens of the map inside one cell of this share of the footprint of a token are merged into one anchor")
     ap.add_argument("--fast_dim", type=int, default=128, help="--gscpe fast path: dimensions of the reduced anchors in the ablation row, 0 leaves the row out")
+    ap.add_argument("--no_water_align", dest="water_align", action="store_false",
+                    help="--gscpe fast path: leave out the rows that align the query through the water model of the map (tools/loc_water.py)")
     ap.add_argument("--fast_min_corr", type=float, default=0.25,
                     help="--gscpe fast path: the check accepts a pose when render and query correlate at least this much after the alignment")
     ap.add_argument("--gscpe_depth_m", type=float, default=None,
@@ -737,6 +739,22 @@ def main():
             return img, alp.reshape(hw[0], hw[1]), zmap(d_, alp, hw)
         return (img, alp.reshape(hw[0], hw[1])) if alpha else img
 
+    def water_parts(pose, num, half=True):
+        p_ = pose if torch.is_tensor(pose) else torch.as_tensor(np.asarray(pose), dtype=torch.float32, device=dev)
+        p_ = p_.float().to(dev)
+        m_ = medium_for(modes[0], num, p_)
+        k_ = 2 if half and h % 2 == 0 and w % 2 == 0 else 1
+        J_, a_, z_ = render(p_, m_, f=focal / k_, c=(pp[0] / k_, pp[1] / k_), hw=(h // k_, w // k_), which="restored", t=num / args.fps, depth=True)
+        B_ = background(m_, h, w).float()
+        if k_ > 1:
+            B_ = F.avg_pool2d(B_[None], k_)[0]
+
+        def betas_(zz):
+            bD_, bB_ = beta_at(phys, m_, zz)
+            return bD_.float(), bB_.float()
+
+        return dict(J=J_.clamp(0.0, 1.0), alpha=a_.reshape(h // k_, w // k_), depth=z_, binf=B_, betas=betas_, level=0 if k_ == 1 else 1)
+
     def refine(p0, gt, m1, t=None):
         if args.pose_iters <= 0:
             return p0
@@ -1064,7 +1082,7 @@ def main():
                 out_dir=args.out_dir, ref_poses=ref_poses, ref_fit=ref_fit, ref_source=ref_src[2], coarse_iters=args.gscpe_passes,
                 levels=args.gscpe_levels, steps=args.gscpe_steps, lr=args.gscpe_lr, views=args.gscpe_views,
                 ablation=not args.gscpe_no_ablation, depth_m=args.gscpe_depth_m, fast=not args.gscpe_no_fast, fast_topk=args.fast_topk,
-                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr), fast_cell=args.fast_cell, fast_dim=args.fast_dim))
+                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr), fast_cell=args.fast_cell, fast_dim=args.fast_dim, water=water_parts if args.water_align else None))
             gtext = bench_gscpe.report(gres, dict(
                 scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
                 mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,
