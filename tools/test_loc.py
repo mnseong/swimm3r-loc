@@ -234,6 +234,9 @@ def check_gscpe():
     info = dict(scene="synthetic scene", map_frames=len(mapf), hw=[H, W_], primitives=0, map_mb=0.0, model="stand in", mapping_seconds=None,
                 weights_mb={"none": 0.0}, reference="true poses of the synthetic scene", split="test : train = 1 : %.1f" % (len(mapf) / len(hold)))
     text = C.report(res, info)
+    lof = C.report(dict(res, fit=dict(register=True, k=6, grid=2, tol=2.0, n=8, total=9, half_px_med=0.1, half_px_p90=0.2, half_t_med=0.1,
+                                      half_r_med=0.1, inliers_med=100.0, matches_med=200.0, matcher="LoFTR (test)")), info)
+    assert "another matcher (LoFTR)" in lof and "with LoFTR (test)" in lof and "matcher of the map itself" not in lof and "matcher of the map itself" in text
     print(text)
     row = lambda label: next(r for r in res["rows"] if r["label"] == label)
     a0, a1, a2 = row("pose of the retrieved map frame"), row("coarse: render, match, PnP"), row("refine: + masked warping")
@@ -257,6 +260,66 @@ def check_gscpe():
     short_text = C.report(short, info)
     assert [r["label"] for r in short["rows"]] == labels[:4] and "the same in cm" not in short_text and short["stages"]["iters"] == 1.0
     assert "lpips" not in short["rows"][1] and "%%" not in short_text
+
+
+def check_register_matcher():
+    dev = torch.device("cpu")
+    tt = lambda p: torch.tensor(np.asarray(p), dtype=torch.float32)
+    nums = list(range(2, 41))
+    hold = [n for k, n in enumerate(nums) if 4 <= k % 12 <= 6]
+    mapf = [n for n in nums if n not in hold]
+    name = lambda i: "%06d.jpg" % i
+    truth = {i: true_pose(i) for i in nums}
+    with torch.no_grad():
+        imgs = torch.stack([render(tt(truth[i])) for i in mapf])
+        depth = torch.stack([surface_points(tt(truth[i]))[1] for i in mapf])
+    c2w = torch.stack([tt(truth[i]) for i in mapf])
+    intr = torch.tensor([[FOCAL, 0.0, PP[0] - 0.5], [0.0, FOCAL, PP[1] - 0.5], [0.0, 0.0, 1.0]]).expand(len(mapf), 3, 3).contiguous()
+    net = StandIn()
+    loc = loc_ff.Localizer(net, loc_ff.encode_frames(net, imgs), depth, torch.full_like(depth, 2.0), intr, c2w, FOCAL, PP, 1.0, dev, subsample=4, reproj=2.5)
+    rng = np.random.default_rng(8)
+    cur, calls = {}, []
+
+    def load(nm):
+        cur["pose"] = truth[E.fnum(nm)]
+        with torch.no_grad():
+            return render(tt(cur["pose"]))
+
+    def matcher(q, m):
+        i = next(k for k in range(len(mapf)) if torch.equal(m, imgs[k]))
+        calls.append(i)
+        v, u = np.meshgrid(np.arange(3, H, 6), np.arange(3, W_, 6), indexing="ij")
+        u, v = u.reshape(-1), v.reshape(-1)
+        X = loc.xyz[i][v, u].double().numpy()
+        w2c = np.linalg.inv(cur["pose"])
+        Xc = X @ w2c[:3, :3].T + w2c[:3, 3]
+        z = np.where(Xc[:, 2] > 1e-6, Xc[:, 2], 1e-6)
+        pq = np.stack([loc.K[0, 0] * Xc[:, 0] / z + loc.K[0, 2], loc.K[1, 1] * Xc[:, 1] / z + loc.K[1, 2]], 1) + rng.normal(0.0, 0.3, (len(u), 2))
+        inside = (Xc[:, 2] > 1e-6) & (pq[:, 0] >= 0) & (pq[:, 0] <= W_ - 1) & (pq[:, 1] >= 0) & (pq[:, 1] <= H - 1)
+        return pq[inside], np.stack([u, v], 1).astype(np.float64)[inside]
+
+    matcher.name = "a stand in matcher"
+    tests = [name(i) for i in hold]
+    interp = E.interpolate_poses(c2w.numpy().astype(np.float64), hold, mapf)
+    poses, fit, rows = R.register_queries(loc, tests, load, mapf, interp, k=6, tol=1.5, verbose=False, matcher=matcher, images=imgs)
+    assert len(calls) == 6 * len(hold) and loc.subsample == 4, (len(calls), loc.subsample)
+    pts = surface_points(tt(truth[hold[4]]))[0].reshape(-1, 3)[::37].double().numpy()
+    err = np.array([G.pixel_shift(loc.K, truth[E.fnum(n)], poses[n], pts, (H, W_)) for n in poses])
+    print("queries registered with another matcher than the map: %d of %d with a reference, against the true poses a median of %.3f px (largest %.3f), "
+          "earlier and later map frames alone differ by %.2f px, median %d inliers of %d matches" % (
+              fit["n"], fit["total"], np.median(err), np.max(err), fit["half_px_med"], fit["inliers_med"], fit["matches_med"]))
+    assert fit["matcher"] == "a stand in matcher" and fit["n"] >= 8 and np.median(err) < 0.3 and np.max(err) < 1.0, (fit, err)
+    lines = R.reference_lines(fit, skipped=fit["total"] - fit["n"])
+    text = "\n".join(lines)
+    assert "with a stand in matcher" in text and "none of the methods below uses" in text and "%%" not in text and len(lines) == 5, lines
+    ours = R.reference_lines(dict(fit, matcher=None))
+    assert "grid every" in "\n".join(ours) and len(ours) == 5
+    p2, p3 = R.lift(loc, 0, np.array([[1.0, 2.0], [3.0, 4.0]]), np.array([[-5.0, 10.0], [W_ + 9.0, H + 9.0]]))
+    assert p2.shape == (2, 2) and p3.shape == (2, 3) and np.allclose(p3[0], loc.xyz[0][10, 0].double().numpy())
+    loc.valid[0][10, 0] = False
+    p2, p3 = R.lift(loc, 0, np.array([[1.0, 2.0]]), np.array([[0.2, 9.8]]))
+    assert len(p2) == 0 and len(p3) == 0
+    loc.valid[0][10, 0] = True
 
 
 def check_register():
@@ -326,6 +389,7 @@ def main():
     check_pose_files()
     check_warp()
     check_register()
+    check_register_matcher()
     check_gscpe()
     dev = torch.device("cpu")
     nums = list(range(2, 41))

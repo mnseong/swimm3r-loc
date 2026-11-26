@@ -32,7 +32,9 @@ if [ "$HOLD" != 0 ]; then
   HB="$HOLD"
   [ "$BLOCK" = 1 ] || HB="${HOLD}b${BLOCK}"
   SD="$OUT/map${TAG}_hold${HB}w${WIN}"
-  case "$HM" in register) O="$OUT/${M}${TAG}_hold${HB}w${WIN}" ;; moved) O="$OUT/${M}${TAG}_hold${HB}w${WIN}_moved" ;; same) SD="$OUT/split${TAG}_hold${HB}"; O="$OUT/${M}${TAG}_hold${HB}_same" ;; esac
+  RS=""
+  [ "$HM" = register ] && [ "${REF_MATCHER:-ours}" = loftr ] && RS="_loftr"
+  case "$HM" in register) O="$OUT/${M}${TAG}_hold${HB}w${WIN}${RS}" ;; moved) O="$OUT/${M}${TAG}_hold${HB}w${WIN}_moved" ;; same) SD="$OUT/split${TAG}_hold${HB}"; O="$OUT/${M}${TAG}_hold${HB}_same" ;; esac
   mkdir -p "$SD" "$O"
   ls data/video1/images | grep -E '\.(jpg|jpeg|png)$' | sort > "$SD/all.txt"
   awk -v s="$HOLD" -v b="$BLOCK" '{a[NR]=$0} END{c=int((s-b)/2); for(i=1;i<=NR;i++){r=(i-1)%s; h=(b==1)?(i%s==0):(r>=c && r<c+b); if (i==1 || i==NR || (b>1 && i-r+s-1>NR)) h=0; if (!h) print a[i]}}' "$SD/all.txt" > "$SD/frames.txt"
@@ -51,7 +53,13 @@ if [ "$HOLD" != 0 ]; then
   elif [ "$HM" = register ]; then
     MP="$SD"
     echo "mapping frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($SPLIT), $NQ queries, pair window $WIN; Stage 1 sees the map frames alone, every query is then registered into that fixed map for its reference pose"
-    EXTRA=(--split_json "$SD/split.json" --ref_register "${REF_K:-6}" --proto_ref_frames 2)
+    RM="${REF_MATCHER:-ours}"
+    case "$RM" in ours|loftr) ;; *) echo "REF_MATCHER must be ours or loftr"; exit 1 ;; esac
+    if [ "$RM" = loftr ] && ! python -c "import kornia.feature" 2>/dev/null; then
+      echo "REF_MATCHER=loftr registers the queries with LoFTR of kornia, which this environment lacks: pip install kornia (then run again, the map is kept)"; exit 1
+    fi
+    echo "reference of the queries: registration into the fixed map, matcher $RM"
+    EXTRA=(--split_json "$SD/split.json" --ref_register "${REF_K:-6}" --ref_matcher "$RM" --proto_ref_frames 2)
   else
     MP="$SD"
     echo "mapping frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($SPLIT), $NQ queries, pair window $WIN; the reference is moved in from another reconstruction of all frames"

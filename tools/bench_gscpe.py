@@ -521,7 +521,9 @@ def report(res, info):
     L += ["-" * W,
           " px: median shift of the map points in the image between the estimate and the reference. flow: median optical flow in px between the query and the",
           " render at the estimated pose, no reference involved. LPIPS, SSIM, PSNR: underwater render at the estimated pose against the query. The reference",
-          " is made with the matcher of the map itself, so the rows that match with the same backbone are not independent of it. Time per query runs from the query on the GPU to the pose. Image loading and scoring are not timed. J: mean power of the pass",
+          (" is matched with another matcher (LoFTR) than every method below, its 3D points are those of the map." if (res.get("fit") or {}).get("matcher") else
+           " is made with the matcher of the map itself, so the rows that match with the same backbone are not independent of it.")
+          + " Time per query runs from the query on the GPU to the pose. Image loading and scoring are not timed. J: mean power of the pass",
           " (tegrastats) times the mean time per query. PnP threshold %.1f px, solver: %s. Matching grid every %d px." % (
               res["reproj_px"], res.get("solver", "none"), res["subsample"]),
           " Taken from the paper: test 1 to train 3 split with unseen queries, pose of the best retrieved frame as the start, render, match, lift by the rendered",

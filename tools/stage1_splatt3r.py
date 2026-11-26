@@ -253,6 +253,10 @@ def main():
                          "made from the map frames alone, the queries never entered Stage 1): matches to the K map frames nearest in time "
                          "lifted by the points of the map, PnP with RANSAC and a refit on all matches; a reference counts when the "
                          "registrations on the earlier and on the later map frames alone agree within --proto_ref_tol px (tools/loc_ref.py)")
+    ap.add_argument("--ref_matcher", choices=("ours", "loftr"), default="ours",
+                    help="--ref_register: match the queries to the map frames with the backbone of the map (ours) or with LoFTR of kornia, "
+                         "a matcher no method of the benchmark uses (loftr, outdoor weights)")
+    ap.add_argument("--ref_loftr_conf", type=float, default=0.5, help="--ref_matcher loftr: lowest LoFTR confidence of a match")
     ap.add_argument("--proto_ref_poses", default=None,
                     help="--proto and --gscpe: reference poses of all frames from another reconstruction, a COLMAP model (folder, images.bin "
                          "or images.txt) or a json of name to camera to world 4 x 4, moved into this map like --proto_ref_scene")
@@ -926,10 +930,12 @@ def main():
         load_query = lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev)
         if args.ref_register > 0 and held_ref is None:
             import loc_ref
+            rm = loc_ref.loftr_matcher(dev, conf_min=args.ref_loftr_conf) if args.ref_matcher == "loftr" else None
             ref_poses, ref_fit, ref_rows = loc_ref.register_queries(
                 loc, tests, load_query, fnums, E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums), k=args.ref_register,
-                tol=args.proto_ref_tol)
-            ref_text = "every query registered into the fixed map"
+                tol=args.proto_ref_tol, matcher=rm, images=imgs if rm is not None else None)
+            del rm
+            ref_text = "every query registered into the fixed map" + (" with LoFTR" if args.ref_matcher == "loftr" else "")
             ref_src = (None, None, "registration into the fixed map", ref_text)
             json.dump(bench_proto.clean(dict(fit=ref_fit, queries=ref_rows, poses=ref_poses)), open(os.path.join(args.out_dir, "reference_register.json"), "w"), indent=1)
             print("[ref] %d of %d queries have a reference: the registrations on the earlier and the later map frames differ by a median of %s px" % (
