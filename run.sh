@@ -14,7 +14,7 @@ LOC=(--anchor_px 6 --min_conf_thr 0.2 --fps 5 --medium_raster preshade --binf_ve
 case "$M" in
   v9c) ;;
   v9c_best) LOC+=(--time_bucket 8 --time_fill --far_layer) ;;
-  *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses] run.sh [v9c|v9c_best] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=4 holds out every 4th frame as a query (test 1 : train 3); by default as GS-CPE one Stage 1 reconstruction of all frames gives the poses and the queries are left out of the Gaussian map (HOLD_MAP=separate maps the other three on their own and moves the reference into that map, REF is then an outside reconstruction used as the reference)"; exit 1 ;;
+  *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses] run.sh [v9c|v9c_best] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=4 holds out every 4th frame as a query (test 1 : train 3), HOLD=12 BLOCK=3 three consecutive frames in the middle of every 12 (blocks never at the ends); by default as GS-CPE one Stage 1 reconstruction of all frames gives the poses and the queries are left out of the Gaussian map (HOLD_MAP=separate maps the other three on their own and moves the reference into that map, REF is then an outside reconstruction used as the reference)"; exit 1 ;;
 esac
 export PYTHONPATH="$D/ubs/submodules:${PYTHONPATH:-}"
 STRIDE="${STRIDE:-1}"
@@ -26,14 +26,18 @@ EXTRA=()
 if [ "$HOLD" != 0 ]; then
   [ "$HOLD" -ge 2 ] || { echo "HOLD must be 2 or more"; exit 1; }
   HM="${HOLD_MAP:-same}"
-  if [ "$HM" = same ]; then SD="$OUT/split${TAG}_hold${HOLD}"; O="$OUT/${M}${TAG}_hold${HOLD}"; else SD="$OUT/map${TAG}_hold${HOLD}w${WIN}"; O="$OUT/${M}${TAG}_hold${HOLD}w${WIN}"; fi
+  BLOCK="${BLOCK:-1}"
+  [ "$BLOCK" -ge 1 ] && [ "$BLOCK" -lt "$HOLD" ] || { echo "BLOCK must be 1 or more and below HOLD"; exit 1; }
+  HB="$HOLD"
+  [ "$BLOCK" = 1 ] || HB="${HOLD}b${BLOCK}"
+  if [ "$HM" = same ]; then SD="$OUT/split${TAG}_hold${HB}"; O="$OUT/${M}${TAG}_hold${HB}"; else SD="$OUT/map${TAG}_hold${HB}w${WIN}"; O="$OUT/${M}${TAG}_hold${HB}w${WIN}"; fi
   mkdir -p "$SD" "$O"
   ls data/video1/images | grep -E '\.(jpg|jpeg|png)$' | sort > "$SD/all.txt"
-  awk -v s="$HOLD" '{a[NR]=$0} END{for(i=1;i<=NR;i++) if (i%s!=0 || i==NR) print a[i]}' "$SD/all.txt" > "$SD/frames.txt"
+  awk -v s="$HOLD" -v b="$BLOCK" '{a[NR]=$0} END{c=int((s-b)/2); for(i=1;i<=NR;i++){r=(i-1)%s; h=(b==1)?(i%s==0):(r>=c && r<c+b); if (i==1 || i==NR || (b>1 && i-r+s-1>NR)) h=0; if (!h) print a[i]}}' "$SD/all.txt" > "$SD/frames.txt"
   python -c "import json,sys; d=sys.argv[1]; a=[l.strip() for l in open(d+'/all.txt') if l.strip()]; m=set(l.strip() for l in open(d+'/frames.txt')); json.dump({'test_files':[x for x in a if x not in m],'centre_files':[]}, open(d+'/split.json','w'))" "$SD"
   NQ=$(( $(wc -l < "$SD/all.txt") - $(wc -l < "$SD/frames.txt") ))
   if [ "$HM" = same ]; then
-    echo "map frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") (every ${HOLD}th frame is a query, test 1 : train $((HOLD - 1))), $NQ queries; as GS-CPE: one Stage 1 reconstruction of all frames gives every pose, the queries are left out of the Gaussian map, the medium field and the retrieval store, and their poses there are the ground truth"
+    echo "map frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($BLOCK consecutive frames of every $HOLD are queries, test $BLOCK : train $((HOLD - BLOCK))), $NQ queries; as GS-CPE: one Stage 1 reconstruction of all frames gives every pose, the queries are left out of the Gaussian map, the medium field and the retrieval store, and their poses there are the ground truth"
     if [ ! -f "$OUT/map${TAG}_all/scene.pkl" ]; then
       echo "the Stage 1 reconstruction of all frames is missing: it is made first (EVERY=1)"
       HOLD=0 REF= TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
@@ -43,7 +47,7 @@ if [ "$HOLD" != 0 ]; then
     EXTRA=(--split_json "$SD/split.json" --map_holdout "$SD/split.json" --proto_ref_frames 2)
   else
     MP="$SD"
-    echo "mapping frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") (every ${HOLD}th frame is held out, test 1 : train $((HOLD - 1))), the other $NQ are queries, pair window $WIN, mapped on their own"
+    echo "mapping frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($BLOCK consecutive frames of every $HOLD held out, test $BLOCK : train $((HOLD - BLOCK))), the other $NQ are queries, pair window $WIN, mapped on their own"
     EXTRA=(--split_json "$SD/split.json")
     if [ -n "$REF" ]; then
       [ -e "$REF" ] || { echo "no reference reconstruction at $REF, stopped"; exit 1; }
