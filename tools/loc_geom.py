@@ -108,18 +108,49 @@ def _errors(x, p3d, p2d, K):
     return e
 
 
-def robust_pnp(p3d, p2d, K, thr, init):
-    from scipy.optimize import least_squares
-    x = _to_x(init)
-    r = least_squares(lambda v: _reproj(v, p3d, p2d, K).ravel(), x, loss="cauchy", f_scale=float(thr), max_nfev=60)
-    x = r.x
-    for _ in range(2):
+def _skew(c):
+    z = np.zeros(len(c))
+    return np.stack([np.stack([z, -c[:, 2], c[:, 1]], 1), np.stack([c[:, 2], z, -c[:, 0]], 1), np.stack([-c[:, 1], c[:, 0], z], 1)], 1)
+
+
+def _gauss_newton(x, p3d, p2d, K, weight, steps):
+    R, t = rot(x[:3]), np.array(x[3:], dtype=np.float64)
+    for _ in range(steps):
+        c = p3d @ R.T + t
+        z = np.where(np.abs(c[:, 2]) > 1e-9, c[:, 2], 1e-9)
+        r = np.stack([K[0, 0] * c[:, 0] / z + K[0, 2] - p2d[:, 0], K[1, 1] * c[:, 1] / z + K[1, 2] - p2d[:, 1]], 1)
+        w = weight(r, c)
+        Jc = np.zeros((len(c), 2, 3))
+        Jc[:, 0, 0] = K[0, 0] / z
+        Jc[:, 0, 2] = -K[0, 0] * c[:, 0] / (z * z)
+        Jc[:, 1, 1] = K[1, 1] / z
+        Jc[:, 1, 2] = -K[1, 1] * c[:, 1] / (z * z)
+        J = np.concatenate([-Jc @ _skew(c - t), Jc], 2)
+        Jw = J * w[:, None, None]
+        Hm = np.einsum("nij,nik->jk", Jw, J)
+        d = np.linalg.solve(Hm + 1e-9 * np.trace(Hm) * np.eye(6), -np.einsum("nij,ni->j", Jw, r))
+        R, t = rot(d[:3]) @ R, t + d[3:]
+    return np.r_[rotvec(R), t]
+
+
+def polish(x, p3d, p2d, K, thr, rounds=3):
+    s2 = float(thr) ** 2
+    x = _gauss_newton(x, p3d, p2d, K, lambda r, c: (c[:, 2] > 1e-9) / (1.0 + (r * r).sum(1) / s2), 6)
+    for _ in range(rounds):
         inl = _errors(x, p3d, p2d, K) < thr
         if int(inl.sum()) < 6:
             return None
-        x = least_squares(lambda v: _reproj(v, p3d[inl], p2d[inl], K).ravel(), x, max_nfev=40).x
-    inl = _errors(x, p3d, p2d, K) < thr
-    return dict(c2w=_to_c2w(x), inliers=int(inl.sum()), solver="least squares from the start pose")
+        x = _gauss_newton(x, p3d[inl], p2d[inl], K, lambda r, c: np.ones(len(r)), 3)
+    return x if np.isfinite(x).all() else None
+
+
+def robust_pnp(p3d, p2d, K, thr, init):
+    from scipy.optimize import least_squares
+    x = least_squares(lambda v: _reproj(v, p3d, p2d, K).ravel(), _to_x(init), loss="cauchy", f_scale=float(thr), max_nfev=60).x
+    x = polish(x, p3d, p2d, K, thr)
+    if x is None:
+        return None
+    return dict(c2w=_to_c2w(x), inliers=int((_errors(x, p3d, p2d, K) < thr).sum()), solver="least squares from the start pose")
 
 
 def solve_pnp(p3d, p2d, K, thr, init=None, iters=2000):
@@ -127,6 +158,7 @@ def solve_pnp(p3d, p2d, K, thr, init=None, iters=2000):
     p2d = np.ascontiguousarray(p2d, dtype=np.float64)
     if len(p3d) < 6:
         return None
+    cands = []
     if cv2 is not None:
         try:
             ok, rvec, tvec, inl = cv2.solvePnPRansac(p3d, p2d, K, None, iterationsCount=int(iters), reprojectionError=float(thr),
@@ -137,9 +169,20 @@ def solve_pnp(p3d, p2d, K, thr, init=None, iters=2000):
                     rvec, tvec = cv2.solvePnPRefineLM(p3d[inl], p2d[inl], K, None, rvec, tvec)
                 x = np.r_[np.asarray(rvec, dtype=np.float64).ravel(), np.asarray(tvec, dtype=np.float64).ravel()]
                 if np.isfinite(x).all():
-                    return dict(c2w=_to_c2w(x), inliers=int((_errors(x, p3d, p2d, K) < thr).sum()), solver="cv2 RANSAC SQPNP")
+                    y = polish(x, p3d, p2d, K, thr)
+                    cands.append((x if y is None else y, "cv2 RANSAC SQPNP, refit on all matches"))
         except Exception:
             pass
+    if init is not None and cands:
+        try:
+            y = polish(_to_x(init), p3d, p2d, K, thr)
+            if y is not None:
+                cands.append((y, "start pose, refit on all matches"))
+        except Exception:
+            pass
+    if cands:
+        x, name = max(cands, key=lambda c: int((_errors(c[0], p3d, p2d, K) < thr).sum()))
+        return dict(c2w=_to_c2w(x), inliers=int((_errors(x, p3d, p2d, K) < thr).sum()), solver=name)
     if init is None:
         return None
     try:
