@@ -8,6 +8,7 @@ W="${WEIGHTS:-ckpt/joint_s3r_v8/weights}"
 LORA="${LORA:-$W/0019_lora.pth}"
 PHYS="${PHYS:-$W/0019_physics.pth}"
 H="${HEAD:-ckpt/head_s3r_v9c/final_splatt3r.pth}"
+TAG0="${TAG:-}"
 TAG="${TAG:+_$TAG}"
 LOC=(--anchor_px 6 --min_conf_thr 0.2 --fps 5 --medium_raster preshade --binf_veil)
 case "$M" in
@@ -31,7 +32,7 @@ if [ "$EVERY" != 0 ]; then
   if [ "$EVERY" != 1 ]; then
     if [ ! -f "$OUT/map${TAG}_all/scene.pkl" ]; then
       echo "the mapping of all frames, the reference of the sparse maps, is missing: it is made first (EVERY=1)"
-      EVERY=1 bash "$D/run.sh" "$M" "$OUT"
+      TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
     fi
     [ -f "$OUT/map${TAG}_all/scene.pkl" ] || { echo "no reference mapping at $OUT/map${TAG}_all, stopped"; exit 1; }
     EXTRA+=(--proto_ref_scene "$OUT/map${TAG}_all" --proto_ref_frames 2)
