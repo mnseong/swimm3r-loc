@@ -20,6 +20,8 @@ case "$M" in
   *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses] run.sh [v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; exit 1 ;;
 esac
 export PYTHONPATH="$D/ubs/submodules:${PYTHONPATH:-}"
+mkdir -p "$D/.cache/torch" "$D/.cache/tmp" "$D/.cache/mpl"
+export TORCH_HOME="$D/.cache/torch" TMPDIR="$D/.cache/tmp" MPLCONFIGDIR="$D/.cache/mpl"
 STRIDE="${STRIDE:-1}"
 WIN="${WIN:-5}"
 EVERY="${EVERY:-0}"
