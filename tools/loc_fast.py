@@ -63,18 +63,19 @@ def token_matches(loc, fq, idx, temp=0.07):
 
 
 class TokenAnchors:
-    def __init__(self, loc, cell=1.0, min_views=1):
+    def __init__(self, loc, cell=0.25, min_views=1, dim=0):
+        t0 = time.time()
         ps, gh, gw = token_grid(loc)
         self.ps, self.gh, self.gw = ps, gh, gw
-        feats, pts, frames = [], [], []
+        dev = loc.tokens.device
         with torch.no_grad():
+            pts, oks, frames = [], [], []
             for i in range(loc.n):
                 p, ok = token_points(loc, i, ps)
-                f = F.normalize(loc.tokens[i].float() - loc.mean_token, dim=-1)
-                feats.append(f[ok])
-                pts.append(p[ok])
-                frames.append(torch.full((int(ok.sum()),), i, device=p.device, dtype=torch.long))
-            feats, pts, frames = torch.cat(feats), torch.cat(pts), torch.cat(frames)
+                pts.append(p[ok].float())
+                oks.append(ok)
+                frames.append(torch.full((int(ok.sum()),), i, device=dev, dtype=torch.long))
+            pts, frames = torch.cat(pts), torch.cat(frames)
             self.n_tokens = int(pts.shape[0])
             depth = ((pts - loc.centres[frames]) * loc.forward[frames]).sum(-1)
             self.voxel = float(cell) * ps * float(depth.clamp_min(1e-6).median()) / loc.focal
@@ -83,31 +84,40 @@ class TokenAnchors:
             flat = (key[:, 0] * dims[1] + key[:, 1]) * dims[2] + key[:, 2]
             uniq, inv = torch.unique(flat, return_inverse=True)
             m = int(uniq.numel())
-            cnt = torch.zeros(m, device=pts.device).index_add_(0, inv, torch.ones(len(inv), device=pts.device))
-            xyz = torch.zeros(m, 3, device=pts.device).index_add_(0, inv, pts) / cnt[:, None]
-            feat = F.normalize(torch.zeros(m, feats.shape[1], device=pts.device).index_add_(0, inv, feats), dim=-1)
+            one = torch.ones(len(inv), device=dev)
+            cnt = torch.zeros(m, device=dev).index_add_(0, inv, one)
+            xyz = torch.zeros(m, 3, device=dev).index_add_(0, inv, pts) / cnt[:, None]
             pairs = torch.unique(inv * loc.n + frames)
-            views = torch.zeros(m, device=pts.device).index_add_(0, torch.div(pairs, loc.n, rounding_mode="floor"), torch.ones(len(pairs), device=pts.device))
+            views = torch.zeros(m, device=dev).index_add_(0, torch.div(pairs, loc.n, rounding_mode="floor"), torch.ones(len(pairs), device=dev))
+            feat = torch.zeros(m, int(loc.tokens.shape[-1]), device=dev)
+            at = 0
+            for i in range(loc.n):
+                k = int(oks[i].sum())
+                if k:
+                    feat.index_add_(0, inv[at:at + k], F.normalize(loc.tokens[i].float() - loc.mean_token, dim=-1)[oks[i]])
+                at += k
+            self.all = m
             keep = views >= float(min_views)
+            self.min_views = int(min_views)
             if int(keep.sum()) < 64:
-                keep = torch.ones_like(keep)
-            self.xyz, self.feat, self.views = xyz[keep], feat[keep], views[keep]
-        self.m = int(self.xyz.shape[0])
+                keep, self.min_views = torch.ones_like(keep), 1
+            xyz, feat, views = xyz[keep], F.normalize(feat[keep], dim=-1), views[keep]
+            self.basis, self.kept = None, 1.0
+            if dim and int(dim) < feat.shape[1]:
+                cov = (feat.t() @ feat).double().cpu()
+                w, v = torch.linalg.eigh(cov)
+                self.basis = v[:, -int(dim):].float().to(dev)
+                self.kept = float(w[-int(dim):].sum() / w.sum().clamp_min(1e-12))
+                feat = F.normalize(feat @ self.basis, dim=-1)
+            self.xyz, self.feat, self.views = xyz, feat, views
+        self.m, self.dim, self.cell = int(self.xyz.shape[0]), int(self.feat.shape[1]), float(cell)
+        self.seconds = time.time() - t0
 
     def megabytes(self):
-        return (self.feat.numel() + self.xyz.numel()) * 4 / 1e6
+        n = self.feat.numel() + self.xyz.numel() + (self.basis.numel() if self.basis is not None else 0)
+        return n * 4 / 1e6
 
-    @torch.no_grad()
-    def match(self, loc, fq, temp=0.07):
-        q = F.normalize(fq[0].float() - loc.mean_token, dim=-1)
-        sim = q @ self.feat.t()
-        best_a = sim.argmax(1)
-        best_q = sim.argmax(0)
-        t = torch.arange(sim.shape[0], device=sim.device)
-        mutual = best_q[best_a] == t
-        if not bool(mutual.any()):
-            return np.zeros((0, 2)), np.zeros((0, 3)), 0
-        qi, ai = t[mutual], best_a[mutual]
+    def subtoken(self, sim, qi, ai, temp):
         gh, gw, ps = self.gh, self.gw, self.ps
         qy, qx = torch.div(qi, gw, rounding_mode="floor"), qi % gw
         row = F.pad(sim[:, ai].t().reshape(-1, 1, gh, gw), (1, 1, 1, 1), value=-1e4)
@@ -116,8 +126,58 @@ class TokenAnchors:
         w = torch.softmax(win / float(temp), dim=1)
         off = torch.tensor([[dx - 1.0, dy - 1.0] for dy in range(3) for dx in range(3)], device=sim.device)
         d = w @ off
-        px = torch.stack([(qx.float() + 0.5 + d[:, 0]) * ps - 0.5, (qy.float() + 0.5 + d[:, 1]) * ps - 0.5], 1)
-        return px.double().cpu().numpy(), self.xyz[ai].double().cpu().numpy(), int(mutual.sum())
+        return torch.stack([(qx.float() + 0.5 + d[:, 0]) * ps - 0.5, (qy.float() + 0.5 + d[:, 1]) * ps - 0.5], 1)
+
+    @torch.no_grad()
+    def match(self, loc, fq, temp=0.07):
+        q = F.normalize(fq[0].float() - loc.mean_token, dim=-1)
+        if self.basis is not None:
+            q = F.normalize(q @ self.basis, dim=-1)
+        sim = q @ self.feat.t()
+        best_a = sim.argmax(1)
+        best_q = sim.argmax(0)
+        t = torch.arange(sim.shape[0], device=sim.device)
+        mutual = best_q[best_a] == t
+        state = dict(sim=sim, best_q=best_q, temp=temp)
+        if not bool(mutual.any()):
+            return np.zeros((0, 2)), np.zeros((0, 3)), 0, state
+        qi, ai = t[mutual], best_a[mutual]
+        px = self.subtoken(sim, qi, ai, temp)
+        return px.double().cpu().numpy(), self.xyz[ai].double().cpu().numpy(), int(mutual.sum()), state
+
+    @torch.no_grad()
+    def guided(self, state, pose, K, reach=1):
+        sim, best_q = state["sim"], state["best_q"]
+        c = torch.as_tensor(np.asarray(pose), dtype=torch.float32, device=sim.device)
+        pc = (self.xyz - c[:3, 3]) @ c[:3, :3]
+        z = pc[:, 2]
+        zs = torch.where(z > 1e-6, z, torch.ones_like(z))
+        tx = torch.floor((float(K[0, 0]) * pc[:, 0] / zs + float(K[0, 2]) + 0.5) / self.ps)
+        ty = torch.floor((float(K[1, 1]) * pc[:, 1] / zs + float(K[1, 2]) + 0.5) / self.ps)
+        by, bx = torch.div(best_q, self.gw, rounding_mode="floor").float(), (best_q % self.gw).float()
+        seen = (z > 1e-6) & (tx >= 0) & (tx < self.gw) & (ty >= 0) & (ty < self.gh)
+        ok = seen & ((bx - tx).abs() <= reach) & ((by - ty).abs() <= reach)
+        ai = torch.nonzero(ok)[:, 0]
+        if len(ai) == 0:
+            return np.zeros((0, 2)), np.zeros((0, 3)), int(seen.sum())
+        px = self.subtoken(sim, best_q[ai], ai, state["temp"])
+        return px.double().cpu().numpy(), self.xyz[ai].double().cpu().numpy(), int(seen.sum())
+
+
+@torch.no_grad()
+def vote_frame(loc, p3d):
+    if len(p3d) == 0:
+        return None
+    P = torch.as_tensor(np.asarray(p3d), dtype=torch.float32, device=loc.dev)
+    pc = torch.einsum("nkj,nji->nki", P[None] - loc.centres[:, None], loc.c2w[:, :3, :3])
+    z = pc[..., 2]
+    zs = torch.where(z > 1e-6, z, torch.ones_like(z))
+    u = float(loc.K[0, 0]) * pc[..., 0] / zs + float(loc.K[0, 2])
+    v = float(loc.K[1, 1]) * pc[..., 1] / zs + float(loc.K[1, 2])
+    inside = (z > 1e-6) & (u >= 0) & (u <= loc.w - 1) & (v >= 0) & (v <= loc.h - 1)
+    off = ((u - 0.5 * (loc.w - 1)).abs() / loc.w + (v - 0.5 * (loc.h - 1)).abs() / loc.h) * inside
+    score = inside.sum(1).float() - off.sum(1) / inside.sum(1).clamp_min(1)
+    return int(score.argmax())
 
 
 def box(x, k):
@@ -235,7 +295,7 @@ def direct_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3),
     return out
 
 
-def localize_fast(loc, img, render_at, topk=2, thr_px=None, half=False, photo="lcn", levels=(3, 2, 1), iters=(5, 4, 3), anchors=None):
+def localize_fast(loc, img, render_at, topk=2, thr_px=None, half=False, photo="lcn", levels=(3, 2, 1), iters=(5, 4, 3), anchors=None, guided=True, support=64):
     t = {}
     sync(loc.dev)
     a = time.time()
@@ -250,22 +310,41 @@ def localize_fast(loc, img, render_at, topk=2, thr_px=None, half=False, photo="l
         p2d, p3d, n_mutual = token_matches(loc, fq, idx)
         start = loc.poses[idx[0]]
     else:
-        p2d, p3d, n_mutual = anchors.match(loc, fq)
-        idx, start = None, None
+        p2d, p3d, n_mutual, state = anchors.match(loc, fq)
+        vote = vote_frame(loc, p3d)
+        idx = None
+        start = loc.poses[vote] if vote is not None else None
     sync(loc.dev)
     t["tokens"] = time.time() - a
     a = time.time()
     sol = G.solve_pnp(p3d, p2d, loc.K, thr, start) if len(p2d) >= 6 else None
     coarse_ok = sol is not None and bool(np.isfinite(sol["c2w"]).all())
-    if idx is None:
-        idx = loc.near(sol["c2w"], 1) if coarse_ok else loc.retrieve(fq, 1)[0]
-        start = loc.poses[idx[0]]
     t["pnp"] = time.time() - a
+    n_first, n_seen, n_agree, densified = int(len(p2d)), 0, 0, False
+    if anchors is not None and coarse_ok and guided:
+        a = time.time()
+        g2d, g3d, n_seen = anchors.guided(state, sol["c2w"], loc.K)
+        n_agree = int(len(g2d))
+        sync(loc.dev)
+        t["tokens"] += time.time() - a
+        a = time.time()
+        if int(sol["inliers"]) < int(support) and len(g2d) > len(p2d):
+            x = G.polish(G._to_x(sol["c2w"]), g3d, g2d, loc.K, thr)
+            if x is not None:
+                p2d, p3d, densified = g2d, g3d, True
+                sol = dict(c2w=G._to_c2w(x), inliers=int((G._errors(x, g3d, g2d, loc.K) < thr).sum()))
+        t["pnp"] += time.time() - a
+    if idx is None:
+        a = time.time()
+        idx = loc.near(sol["c2w"], 1) if coarse_ok else ([vote] if vote is not None else loc.retrieve(fq, 1)[0])
+        start = loc.poses[idx[0]]
+        t["pnp"] += time.time() - a
     coarse = np.asarray(sol["c2w"], dtype=np.float64) if coarse_ok else np.asarray(start, dtype=np.float64)
     inl = int(sol["inliers"]) if coarse_ok else 0
     al = direct_align(img, coarse, loc.K, lambda p: render_at(p, idx[0]), levels=levels, iters=iters, photo=photo, sync_fn=lambda: sync(loc.dev))
     t["render"], t["align"] = al["stages"]["render"], al["stages"]["align"]
     return dict(ok=bool(coarse_ok and al["ok"]), pose=al["pose"], coarse=coarse, idx=list(idx), matches=int(len(p2d)), mutual=int(n_mutual), inliers=inl,
+                first=n_first, seen=int(n_seen), agree=int(n_agree), densified=bool(densified),
                 corr=al["corr"], valid=al["valid"], steps=al["steps"], shift=al["shift"], stages=t, seconds=float(sum(t.values())), fq=fq)
 
 

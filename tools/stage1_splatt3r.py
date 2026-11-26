@@ -236,6 +236,9 @@ def main():
     ap.add_argument("--fast_photo", choices=("lcn", "affine"), default="lcn",
                     help="--gscpe fast path: the direct alignment compares the locally normalised intensity (lcn) or the colours with one gain "
                          "and offset per channel (affine)")
+    ap.add_argument("--fast_cell", type=float, default=0.25,
+                    help="--gscpe fast path: tokens of the map inside one cell of this share of the footprint of a token are merged into one anchor")
+    ap.add_argument("--fast_dim", type=int, default=128, help="--gscpe fast path: dimensions of the reduced anchors in the ablation row, 0 leaves the row out")
     ap.add_argument("--fast_min_corr", type=float, default=0.25,
                     help="--gscpe fast path: the check accepts a pose when render and query correlate at least this much after the alignment")
     ap.add_argument("--gscpe_depth_m", type=float, default=None,
@@ -999,7 +1002,7 @@ def main():
                 out_dir=args.out_dir, ref_poses=ref_poses, ref_fit=ref_fit, ref_source=ref_src[2], coarse_iters=args.gscpe_passes,
                 levels=args.gscpe_levels, steps=args.gscpe_steps, lr=args.gscpe_lr, views=args.gscpe_views,
                 ablation=not args.gscpe_no_ablation, depth_m=args.gscpe_depth_m, fast=not args.gscpe_no_fast, fast_topk=args.fast_topk,
-                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr)))
+                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr), fast_cell=args.fast_cell, fast_dim=args.fast_dim))
             gtext = bench_gscpe.report(gres, dict(
                 scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
                 mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,

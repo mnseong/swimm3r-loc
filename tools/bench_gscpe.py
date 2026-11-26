@@ -295,6 +295,21 @@ def run(ctx):
                 half = False
                 res["notes"].append("half precision is not usable here: %s: %s" % (type(e).__name__, e))
         info = dict(options=dict(fk, check=chk), half=bool(half))
+        ak = dict(photo=fk["photo"], levels=fk["levels"], iters=fk["iters"], support=int(ctx.get("fast_support", 64)))
+        anchors, low = None, None
+        try:
+            anchors = LF.TokenAnchors(loc, cell=float(ctx.get("fast_cell", 0.25)))
+            info["anchors"] = dict(n=anchors.m, tokens=anchors.n_tokens, cell=anchors.cell, voxel=anchors.voxel, dim=anchors.dim, mb=anchors.megabytes(),
+                                   seconds=anchors.seconds, support=ak["support"])
+            d = int(ctx.get("fast_dim", 128))
+            if ctx.get("ablation", True) and 0 < d < anchors.dim:
+                low = LF.TokenAnchors(loc, cell=anchors.cell, dim=d)
+                info["anchors"].update(low_dim=low.dim, low_mb=low.megabytes(), low_kept=low.kept)
+        except Exception as e:
+            res["notes"].append("the anchors of the map could not be built: %s: %s" % (type(e).__name__, e))
+
+        def coarse_only(r):
+            return dict(r, pose=r["coarse"], seconds=r["seconds"] - r["stages"]["render"] - r["stages"]["align"])
 
         def timed(label, family, fn, keep=None):
             try:
@@ -316,6 +331,8 @@ def run(ctx):
                     extra = {}
                     if "corr" in use[0]:
                         extra = dict(matches=mean(lambda x: x["matches"]), inliers=mean(lambda x: x["inliers"]), steps=mean(lambda x: x["steps"]),
+                                     agree=mean(lambda x: x.get("agree", 0)), seen=mean(lambda x: x.get("seen", 0)),
+                                     densified=mean(lambda x: 100.0 * float(x.get("densified", False))),
                                      corr=float(np.median([x["corr"] for x in use if x["corr"] is not None])) if any(x["corr"] is not None for x in use) else None,
                                      valid=mean(lambda x: x["valid"]), fallback=mean(lambda x: 100.0 * float(x.get("fallback", False))))
                     info[keep] = dict(stages=st, **extra)
@@ -333,6 +350,26 @@ def run(ctx):
             timed("fast, render without the water model", "fast", lambda im: LF.localize_fast(loc, im, at("restored"), **fk))
         if ctx.get("loc_public") is not None:
             timed("public MASt3R: tokens, PnP, alignment", "public", lambda im: LF.localize_fast(ctx["loc_public"], im, at("underwater"), **fk))
+        if anchors is not None:
+            timed("anchors: map tokens in 3D, alignment", "anchor", lambda im: LF.localize_fast(loc, im, at("underwater"), anchors=anchors, **ak), "anchor")
+            timed("anchors + check (decoder if it fails)", "anchor", lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, anchors=anchors, **ak),
+                  "anchor_tiered")
+            if half:
+                timed("anchors + check, half precision", "anchor",
+                      lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, half=True, anchors=anchors, **ak), "anchor_tiered_half")
+            if ctx.get("ablation", True):
+                timed("anchors, PnP only, no alignment", "anchor", lambda im: coarse_only(LF.localize_fast(loc, im, at("underwater"), anchors=anchors, **ak)))
+                timed("anchors without the second pass", "anchor", lambda im: LF.localize_fast(loc, im, at("underwater"), anchors=anchors, guided=False, **ak))
+                timed("anchors, render without the water", "anchor", lambda im: LF.localize_fast(loc, im, at("restored"), anchors=anchors, **ak))
+                if low is not None:
+                    timed("anchors in %d dimensions" % low.dim, "anchor", lambda im: LF.localize_fast(loc, im, at("underwater"), anchors=low, **ak), "anchor_low")
+            if ctx.get("loc_public") is not None:
+                try:
+                    pub_anchors = LF.TokenAnchors(ctx["loc_public"], cell=anchors.cell)
+                    timed("public MASt3R: anchors, alignment", "public",
+                          lambda im: LF.localize_fast(ctx["loc_public"], im, at("underwater"), anchors=pub_anchors, **ak))
+                except Exception as e:
+                    res["notes"].append("public MASt3R anchors failed: %s: %s" % (type(e).__name__, e))
         info.update(lean_ok=loc.lean_ok, lean_diff=loc.lean_diff)
         res["fast"] = info
         save()
@@ -445,6 +482,28 @@ def report(res, info):
             if key != "fast":
                 L.append("   %-28s %.0f %% of the queries fail the check and go through the decoder (mean over all queries: decoder %.0f ms, matching %.0f ms, PnP %.0f ms)" % (
                     "", d["fallback"], ms(d, "fallback_decoder"), ms(d, "fallback_matching"), ms(d, "fallback_pnp")))
+        an = fa.get("anchors")
+        if an:
+            L += ["   Anchors: the tokens of all map frames placed at their points of the map, tokens inside one cell (%.2f of the footprint of a token at the median depth)" % an["cell"],
+                  "   are merged. %d anchors from %d tokens, %d dimensions, %.1f MB, built in %.2f s. The query tokens are matched to all anchors at once (no retrieval, no" % (
+                      an["n"], an["tokens"], an["dim"], an["mb"], an["seconds"]),
+                  "   map frame is chosen first), PnP with RANSAC gives the pose. Second pass: every anchor is projected with that pose and counts as agreeing when the query",
+                  "   token it matches best lies at most one token from its projection. With fewer than %d inliers the pose is refitted on the agreeing anchors." % an["support"]]
+            if an.get("low_dim"):
+                L.append("   In %d dimensions (principal directions of the anchors, %.0f %% of the energy) the anchors take %.1f MB." % (
+                    an["low_dim"], 100.0 * an["low_kept"], an["low_mb"]))
+        for key, name in (("anchor", "anchors"), ("anchor_tiered", "anchors + check"), ("anchor_tiered_half", "anchors + check, half prec."),
+                          ("anchor_low", "anchors, fewer dimensions")):
+            d = fa.get(key)
+            if not d:
+                continue
+            L.append("   %-28s encoder %.0f ms | tokens %.0f ms | PnP %.0f ms | render %.0f ms | alignment %.0f ms in %.1f steps | %.0f inliers of %.0f matches | "
+                     "%.0f of %.0f anchors in view agree | refit for %.0f %% | correlation %s" % (
+                         name, ms(d, "encoder"), ms(d, "tokens"), ms(d, "pnp"), ms(d, "render"), ms(d, "align"), d["steps"], d["inliers"], d["matches"],
+                         d["agree"], d["seen"], d["densified"], fmt(d.get("corr"), "%.2f")))
+            if "tiered" in key:
+                L.append("   %-28s %.0f %% of the queries fail the check and go through the decoder (mean over all queries: decoder %.0f ms, matching %.0f ms, PnP %.0f ms)" % (
+                    "", d["fallback"], ms(d, "fallback_decoder"), ms(d, "fallback_matching"), ms(d, "fallback_pnp")))
         for key, name in (("lean", "descriptor branch only"), ("lean_half", "branch only, half precision")):
             d = fa.get(key)
             if d:
@@ -478,7 +537,8 @@ def report(res, info):
           " 'no water model' renders the restored colours of the map without the medium in both stages. 'no render' matches the query to the retrieved",
           " map frame itself, with no rendering at all.",
           " 'public MASt3R matcher' runs the same pipeline on the same map with the public weights for the retrieval and the matching.",
-          " 'descriptor branch only' skips the pointmap regression of both views, which localization never reads; the descriptors are the same."]
+          " 'descriptor branch only' skips the pointmap regression of both views, which localization never reads; the descriptors are the same.",
+          " 'anchors' rows use no retrieval and no decoder: one encoder pass of the query, one product with the anchors of the map, PnP, one render, alignment."]
     for n in res.get("notes", []):
         L.append(" note: %s" % n)
     L.append("=" * W)
