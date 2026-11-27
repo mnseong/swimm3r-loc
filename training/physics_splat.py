@@ -44,6 +44,7 @@ def load_physics(path, device, betaB_le_betaD=True, binf_spatial=False, **over):
         out_dim = 33
     if out_dim not in (12, 15, 18, 24, 33):
         raise ValueError(f"unexpected physics MLP out_features {out_dim} in {path}")
+    has_light = any(k.startswith("physics.light.") for k in state)
     jerlov, seathru, unified = out_dim == 12, out_dim in (15, 18, 33), out_dim in (18, 33)
     phys = PhysicsRegressor(
         in_dim=1024, hidden=cfg["phys_head_hidden"], max_b=cfg["phys_max_backscatter"], kind="depth_dep",
@@ -51,7 +52,7 @@ def load_physics(path, device, betaB_le_betaD=True, binf_spatial=False, **over):
         constrain_beta_B=cfg["phys_constrain_beta_B"] and not (jerlov or seathru),
         betaB_ratio_min=cfg["phys_betaB_ratio_min"], betaB_ratio_max=cfg["phys_betaB_ratio_max"],
         jerlov_unified_beta=jerlov, seathru_betaB_const=seathru, seathru_betaB_le_betaD=bool(betaB_le_betaD),
-        unified_medium_head=unified, binf_spatial=out_dim == 33)
+        unified_medium_head=unified, binf_spatial=out_dim == 33, light=has_light)
     phys.load_state_dict(state)
     phys = phys.to(device).eval()
     for p in phys.parameters():
@@ -153,6 +154,8 @@ def invert(phys, img01, z, med):
     img01 (B, 3, H, W), z (B, H, W), med from medium()."""
     zz = z[:, None]
     td = torch.exp(-med["beta_D"] * zz)
+    if "light" in med:
+        td = td * med["light"][:, :, None, None]
     tb = torch.exp(-med["beta_B"] * zz)
     binf = med["B_inf_map"] if "B_inf_map" in med else med["B_inf"][:, :, None, None]
     j = (img01 - binf * (1.0 - tb)) / td.clamp_min(phys.coupling["eps"])
@@ -164,12 +167,15 @@ def water_terms(med, z):
     direct transmission exp(-beta_D z) and the backscatter B_inf (1 - exp(-beta_B z)), three channels each."""
     zz = z[:, None]
     binf = med["B_inf_map"] if "B_inf_map" in med else med["B_inf"][:, :, None, None]
-    return torch.cat([torch.exp(-med["beta_D"] * zz), binf * (1.0 - torch.exp(-med["beta_B"] * zz))], dim=1)
+    td = torch.exp(-med["beta_D"] * zz)
+    if "light" in med:
+        td = td * med["light"][:, :, None, None]
+    return torch.cat([td, binf * (1.0 - torch.exp(-med["beta_B"] * zz))], dim=1)
 
 
 def select(med, idx):
     """The media of the views idx (a batch of views kept)."""
-    out = {k: med[k][idx] for k in ("beta_D", "beta_B", "B_inf", "B_inf_map", "params_D", "params_B") if k in med}
+    out = {k: med[k][idx] for k in ("beta_D", "beta_B", "B_inf", "B_inf_map", "params_D", "params_B", "light") if k in med}
     if "beta_D_scale" in med:
         out["beta_D_scale"] = med["beta_D_scale"]
     return out
@@ -180,6 +186,8 @@ def view_medium(med, i):
     out = dict(params_D=med["params_D"][i], params_B=med["params_B"][i], B_inf=med["B_inf"][i])
     if "B_inf_map" in med:
         out["B_inf_map"] = med["B_inf_map"][i]
+    if "light" in med:
+        out["light"] = med["light"][i]
     if "beta_D_scale" in med:
         out["beta_D_scale"] = med["beta_D_scale"]
     return out
@@ -190,6 +198,8 @@ def mean_medium(med, idx):
     out = dict(params_D=med["params_D"][idx].mean(0), params_B=med["params_B"][idx].mean(0), B_inf=med["B_inf"][idx].mean(0))
     if "B_inf_map" in med:
         out["B_inf_map"] = med["B_inf_map"][idx].mean(0)
+    if "light" in med:
+        out["light"] = med["light"][idx].mean(0)
     if "beta_D_scale" in med:
         out["beta_D_scale"] = med["beta_D_scale"]
     return out

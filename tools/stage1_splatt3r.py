@@ -132,6 +132,10 @@ def parser():
     ap.add_argument("--physics", required=True)
     ap.add_argument("--head", default=None, help="trained head (train_gaussian_head.py --gs_head splatt3r, *_splatt3r.pth)")
     ap.add_argument("--splatt3r_ckpt", default=None, help="public Splatt3R checkpoint, used when --head is not given")
+    ap.add_argument("--no_water", action="store_true",
+                    help="no water model, the public Splatt3R baseline: the colours are the observed frames plus the head's residual, every "
+                         "render is the plain render of the map with a black background, no physics head, no medium field; the Gaussians are "
+                         "drawn by the same rasteriser as the maps of our model")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--mast3r", default="naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric")
     ap.add_argument("--phys_beta_D_scale", type=float, nargs=3, default=None)
@@ -359,7 +363,10 @@ def main():
     diag_idx = sorted(set(np.linspace(0, n - 1, args.diag).round().astype(int).tolist())) if args.diag > 0 else []
     from model.lora_model import LoRAMast3r
     net = LoRAMast3r.from_pretrained(args.mast3r)
-    net.load_pretrained_lora(args.lora)
+    if args.lora:
+        net.load_pretrained_lora(args.lora)
+    else:
+        print("[s3r] no LoRA: the public MASt3R backbone (the backbone inside the public Splatt3R checkpoint) maps, retrieves and matches", flush=True)
     net = net.to(dev).eval()
     head = Splatt3RHead(net).to(dev).eval()
     anchor = None
@@ -402,8 +409,12 @@ def main():
         src = args.splatt3r_ckpt + " (public Splatt3R head, not trained on our data)"
     else:
         ap.error("--head or --splatt3r_ckpt")
-    phys = load_physics(args.physics, dev, betaB_le_betaD=True)
-    print(f"[s3r] {n} Stage 1 frames at {h}x{w} | head {src} | physics {phys.coupling}", flush=True)
+    if args.no_water:
+        if anchor is not None:
+            ap.error("--no_water is the public Splatt3R baseline: give --splatt3r_ckpt, not a head of our model")
+        args.medium, args.binf_veil, args.water_align = "nearest", False, False
+    phys = None if args.no_water else load_physics(args.physics, dev, betaB_le_betaD=True)
+    print(f"[s3r] {n} Stage 1 frames at {h}x{w} | head {src} | physics {'none, no water model' if phys is None else phys.coupling}", flush=True)
     observed = anchor is not None and getattr(anchor, "opt", {}).get("colour_base", "restored") == "observed"
     if observed and args.phys_beta_D_scale is not None:
         ap.error("this head was trained on the water of the physics head as it is: no --phys_beta_D_scale")
@@ -416,9 +427,16 @@ def main():
         else:
             raw, zpass, feat = frame_passes(net, head, imgs)
         act = Splatt3RHead.activate(raw)
-        med = medium(phys, feat, depth, beta_D_scale=args.phys_beta_D_scale)
+        med = None if phys is None else medium(phys, feat, depth, beta_D_scale=args.phys_beta_D_scale)
+        light_scene = med["light"].median(0).values if (med is not None and "light" in med) else None
+        if light_scene is not None:
+            print(f"[s3r] light colour of the water column: E per channel {[round(float(x), 4) for x in light_scene]} (median of the map frames), "
+                  f"it multiplies the in air colours in every underwater render", flush=True)
         wt, n_s1 = None, 0
-        if observed:
+        if phys is None:
+            J = imgs.clone()
+            print("[s3r] colour: the observed frames plus the residual of the public Splatt3R head, no water model", flush=True)
+        elif observed:
             J = imgs.clone()
             wt = water_terms(med, depth)
             print("[s3r] colour: the head's own in air colour from the observed frames and the water of the physics head in front of every pixel; "
@@ -586,6 +604,8 @@ def main():
                 return pixel_map({k: v[sel_] for k, v in pr.items()}) if int(sel_.sum()) >= 16 else None
 
             g = pixel_map(pr)
+            if phys is None:
+                g["beta"] = torch.full((g["n_out"],), 4.0, device=dev)
     sync()
     t_map = time.time() - t0
     print(f"[map] confidence > {args.min_conf_thr}: {n_in / 1e6:.2f}M of {n * h * w / 1e6:.2f}M pixels", flush=True)
@@ -597,6 +617,8 @@ def main():
     fnums = [E.fnum(x) for x in names]
 
     def med_of(order):
+        if med is None:
+            return {}
         idx = torch.as_tensor(np.asarray(order), device=dev)
         out = dict(params_D=med["params_D"][idx].mean(0), params_B=med["params_B"][idx].mean(0), B_inf=med["B_inf"][idx].mean(0))
         if "B_inf_map" in med:
@@ -690,6 +712,8 @@ def main():
     print(f"[medium] held out views use {modes[0]}" + (f", also scored with {', '.join(modes[1:])}" if len(modes) > 1 else ""), flush=True)
 
     def medium_for(mode, num, pose, f=focal, c=pp):
+        if phys is None:
+            return {}
         if mode == "field":
             return field.medium_at(pose, f, c, h, w)
         if mode == "views":
@@ -759,11 +783,19 @@ def main():
         if which == "restored":
             im_, d_, a_ = rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
             return (im_, a_.reshape(hw[0], hw[1]), zmap(d_, a_, hw)) if depth else im_
+        if phys is None:
+            im_, d_, a_ = rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+            if depth:
+                return (im_, a_.reshape(hw[0], hw[1]), zmap(d_, a_, hw), im_) if dry else (im_, a_.reshape(hw[0], hw[1]), zmap(d_, a_, hw))
+            if obj:
+                return im_, a_.reshape(hw[0], hw[1]), d_
+            return (im_, a_.reshape(hw[0], hw[1])) if alpha else im_
+        Jw = gg["J"] * light_scene[None] if light_scene is not None else gg["J"]
         if args.medium_raster == "s2" and "beta" in gg:
             with torch.no_grad():
-                dry_, dacc, a0 = rv(gg, gg["J"], cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
+                dry_, dacc, a0 = rv(gg, Jw, cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
                 m_rgb, m_bs, m_attn = MR.medium_maps(phys, m1, MR.expected_depth(dacc, a0, unit), unit)
-            img, _, _ = MR.render_medium_view(gg["means"], gg["opacity"], gg["scales"], gg["quat"], gg["J"], gg["beta"], cu, f, hw[0], hw[1],
+            img, _, _ = MR.render_medium_view(gg["means"], gg["opacity"], gg["scales"], gg["quat"], Jw, gg["beta"], cu, f, hw[0], hw[1],
                                               c, m_rgb, m_bs, m_attn, scale_factor=K_BETA4, eps2d=EPS2D_BETA4, deconf=bool(args.grad_deconf))
             if depth:
                 return (img, a0.reshape(hw[0], hw[1]), zmap(dacc, a0, hw), dry_) if dry else (img, a0.reshape(hw[0], hw[1]), zmap(dacc, a0, hw))
@@ -771,7 +803,7 @@ def main():
         xc = (gg["xyz"] - pose[:3, 3]) @ pose[:3, :3]
         zc = xc[:, 2]
         if "B_inf_map" not in m1:
-            col = underwater_colours(phys, gg["J"], zc, m1)
+            col = underwater_colours(phys, Jw, zc, m1)
             img, d_, alp = rv(gg, col, cu, f, hw[0], hw[1], m1["B_inf"].float().contiguous(), c)
             if depth:
                 return img, alp.reshape(hw[0], hw[1]), zmap(d_, alp, hw)
@@ -780,7 +812,7 @@ def main():
         # open water the map resampled to the render size
         zs = torch.where(zc > 1e-6, zc, torch.ones_like(zc))
         uv = torch.stack([(f * xc[:, 0] / zs + c[0]) * w / hw[1], (f * xc[:, 1] / zs + c[1]) * h / hw[0]], dim=-1)
-        col = underwater_colours(phys, gg["J"], zc, m1, uv)
+        col = underwater_colours(phys, Jw, zc, m1, uv)
         img, d_, alp = rv(gg, col, cu, f, hw[0], hw[1], torch.zeros(3, device=dev), c)
         if obj:
             return img, alp.reshape(hw[0], hw[1]), d_
@@ -1060,7 +1092,7 @@ def main():
         if args.trt_encoder and args.gscpe and dev.type == "cuda":
             try:
                 import trt_encoder
-                trt_encoder.attach(loc, net, args.lora, h, w, dev, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "trt"),
+                trt_encoder.attach(loc, net, args.lora or "public_mast3r", h, w, dev, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "trt"),
                                    [imgs[i] for i in range(min(3, n))], log=lambda m: print(m, flush=True))
             except Exception as e:
                 print(f"[trt] the TensorRT encoder is not used: {type(e).__name__}: {str(e)[:300]}", flush=True)

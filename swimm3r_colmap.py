@@ -476,6 +476,7 @@ def compute_descatter_per_frame(args, scene):
                   f"jerlov_unified_beta={_jerlov_unified}, "
                   f"seathru_betaB_const={_seathru_const}, "
                   f"unified_medium_head={_unified_medium}")
+    _light = any(k.startswith("physics.light.") for k in _peek)
     del _peek
     args.phys_jerlov_unified_beta = _jerlov_unified
     # constrain_beta_B (default True) is mutually exclusive with the tied /
@@ -502,6 +503,7 @@ def compute_descatter_per_frame(args, scene):
         seathru_betaB_le_betaD=bool(getattr(args, "phys_seathru_betaB_le_betaD", False)),
         unified_medium_head=_unified_medium,
         binf_spatial=_binf_spatial,
+        light=_light,
     ).to(device).eval()
     if bool(getattr(args, "phys_seathru_betaB_le_betaD", False)):
         print("[seathru] β^B ≤ β^D cap ACTIVE (forward-time β^B = min(β^B, β^D)) "

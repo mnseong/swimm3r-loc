@@ -6,12 +6,18 @@ M="${1:-v17}"
 OUT="${2:-out}"
 case "$M" in
   v17) W0=ckpt/joint_s3r_v17/weights; H0=ckpt/head_s3r_v17/final_splatt3r.pth; E0=0015 ;;
+  v18e10) W0=ckpt/joint_s3r_v18e10/weights; H0=ckpt/head_s3r_v18e10/final_splatt3r.pth; E0=0009 ;;
+  splatt3r) W0=""; H0=""; E0="" ;;
   v13c) W0=ckpt/joint_s3r_v12/weights; H0=ckpt/head_s3r_v13c/final_splatt3r.pth; E0=0019 ;;
   *) W0=""; H0=""; E0=0019 ;;
 esac
 W="${WEIGHTS:-$W0}"
-LORA="${LORA:-$W/${E0}_lora.pth}"
-PHYS="${PHYS:-$W/${E0}_physics.pth}"
+if [ "$M" = splatt3r ]; then
+  LORA=""; PHYS=""
+else
+  LORA="${LORA:-$W/${E0}_lora.pth}"
+  PHYS="${PHYS:-$W/${E0}_physics.pth}"
+fi
 H="${HEAD:-$H0}"
 TAG0="${TAG:-}"
 TAG="${TAG:+_$TAG}"
@@ -19,7 +25,7 @@ SCENE="${SCENE:-data/video1}"
 SCENE="${SCENE%/}"
 LOC=(--anchor_px 6 --min_conf_thr 0.5 --fps 5 --medium_raster s2 --binf_veil)
 case "$M" in
-  v17|v13c) ;;
+  v17|v18e10|v13c|splatt3r) ;;
   *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses SCENE=folder FIXED_SPLIT=1] run.sh [v17|v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; echo "SCENE=data/sealoc_s1 (default data/video1) takes the images and splits of another scene folder, its name is added to the output folders. FIXED_SPLIT=1 maps the train_files.txt of the scene and localizes the test_files of its split.json, the reference REF of all frames is moved into the map through a similarity on the map frames (HOLD_MAP=moved)"; exit 1 ;;
 esac
 if [ "$(cd "$SCENE" 2>/dev/null && pwd -P)" != "$(cd "$D/data/video1" 2>/dev/null && pwd -P)" ]; then
@@ -130,15 +136,27 @@ else
   awk -v s="$STRIDE" '{a[NR]=$0} END{for(i=1;i<=NR;i+=s) print a[i]; if ((NR-1)%s!=0) print a[NR]}' "$SCENE/train_files.txt" > "$MP/frames.txt"
   echo "mapping frames: $(wc -l < "$MP/frames.txt") of $(wc -l < "$SCENE/train_files.txt") (every ${STRIDE}), pair window $WIN"
 fi
-for f in "$LORA" "$PHYS" "$H" "$(dirname "$(dirname "$LORA")")/train_encoder_args.json"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
+if [ "$M" = splatt3r ]; then
+  SH="${SPLATT3R_HEAD:-ckpt/splatt3r/gaussian_head.pth}"
+  [ -f "$SH" ] || { echo "missing $SH"; exit 1; }
+  MAPARGS=(--pure_mast3r)
+  HEADARGS=(--lora "" --physics "" --splatt3r_ckpt "$SH" --no_water)
+  LOC=(--min_conf_thr 0.5 --fps 5)
+  echo "model: public Splatt3R (public MASt3R backbone, public Splatt3R Gaussian head, no water model), drawn by the same rasteriser as our map"
+else
+  for f in "$LORA" "$PHYS" "$H" "$(dirname "$(dirname "$LORA")")/train_encoder_args.json"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
+  MAPARGS=(--finetuned_model "$LORA")
+  HEADARGS=(--lora "$LORA" --physics "$PHYS" --head "$H")
+fi
 if [ ! -f "$MP/mapping_seconds" ]; then
   echo "mapping: Stage 1 of the map frames with the backbone $LORA, no descatter (the Gaussian head reads the observed colour and the water of the physics head)"
   T0=$(date +%s)
-  python swimm3r_colmap.py --imagedir "$SCENE/images" --outdir "$MP" --finetuned_model "$LORA" --physics_model "" \
+  python swimm3r_colmap.py --imagedir "$SCENE/images" --outdir "$MP" "${MAPARGS[@]}" --physics_model "" \
     --train_test_split none --subset_list "$MP/frames.txt" --winsize "$WIN"
   echo $(( $(date +%s) - T0 )) > "$MP/mapping_seconds"
 fi
 if [ "$EVERY" = 1 ]; then echo "mapping of all frames done in $(cat "$MP/mapping_seconds") s, the reference of the EVERY=N runs: $MP"; exit 0; fi
-python tools/stage1_splatt3r.py --scene_dir "$MP" --data_dir "$SCENE" --lora "$LORA" --physics "$PHYS" \
-  --head "$H" "${LOC[@]}" --medium field --out_dir "$O/loc" --bench \
+MED=(--medium field)
+[ "$M" = splatt3r ] && MED=()
+python tools/stage1_splatt3r.py --scene_dir "$MP" --data_dir "$SCENE" "${HEADARGS[@]}" "${LOC[@]}" ${MED[@]+"${MED[@]}"} --out_dir "$O/loc" --bench \
   --bench_mapping_seconds "$(cat "$MP/mapping_seconds")" ${EXTRA[@]+"${EXTRA[@]}"} "${@:3}"

@@ -185,6 +185,7 @@ class DepthDependentPhysicsHead(nn.Module):
         unified_binf: bool = False,
         binf_max_b: float = 0.7,
         binf_spatial: bool = False,
+        light: bool = False,
     ):
         super().__init__()
         self.b_max = float(b_max)
@@ -289,6 +290,10 @@ class DepthDependentPhysicsHead(nn.Module):
             with torch.no_grad():
                 self.mlp[-1].weight[18:33].zero_()
                 self.mlp[-1].bias[18:33].zero_()
+        if light:
+            self.light = nn.Linear(hidden, 3)
+            nn.init.zeros_(self.light.weight)
+            nn.init.zeros_(self.light.bias)
 
     def _split_params(self, raw: torch.Tensor) -> tuple:
         """Decode raw → (a_D, b_D, c_D, d_D, a_B, b_B, c_B, d_B), each [B, 3].
@@ -356,7 +361,13 @@ class DepthDependentPhysicsHead(nn.Module):
         params (used for view-consistency loss across the pair).
         """
         pooled = feat.mean(dim=1)                      # [B, C]
-        raw = self.mlp(pooled)                         # [B, 12] or [B, 24]
+        if hasattr(self, "light"):
+            hid = self.mlp[:-1](pooled)
+            raw = self.mlp[-1](hid)
+            light = torch.exp(self.light(hid.detach() if getattr(self, "light_detach", False) else hid).clamp(-4.0, 1.0))
+        else:
+            raw = self.mlp(pooled)                         # [B, 12] or [B, 24]
+            light = None
         a_D, b_D, c_D, d_D, a_B, b_B, c_B, d_B = self._split_params(raw)
 
         z_safe = sanitize_physics_depth(z)
@@ -447,6 +458,8 @@ class DepthDependentPhysicsHead(nn.Module):
             out["B_inf"] = torch.sigmoid(raw[:, 15:18]) * self.binf_max_b   # [B, 3]
             if self.binf_spatial:
                 out["B_inf_map"] = binf_map(raw[:, 15:18], raw[:, 18:33], z_.shape[-2], z_.shape[-1]) * self.binf_max_b
+        if light is not None:
+            out["light"] = light
         return out
 
 
@@ -637,6 +650,7 @@ class PhysicsRegressor(nn.Module):
         binf_deep_head: bool = False,
         unified_medium_head: bool = False,
         binf_spatial: bool = False,
+        light: bool = False,
     ):
         super().__init__()
         self.kind = kind
@@ -666,6 +680,7 @@ class PhysicsRegressor(nn.Module):
                 unified_binf=self.unified_medium_head,
                 binf_max_b=max_b,
                 binf_spatial=bool(binf_spatial),
+                light=bool(light),
             )
         else:
             raise ValueError(f"Unknown kind={kind!r}; expected 'scalar' or 'depth_dep'.")
@@ -705,6 +720,8 @@ class PhysicsRegressor(nn.Module):
             out["B_inf"] = d["B_inf"]                 # from the shared MLP trunk
             if "B_inf_map" in d:
                 out["B_inf_map"] = d["B_inf_map"]     # direction dependent veiling light [B, 3, H, W]
+            if "light" in d:
+                out["light"] = d["light"]
         else:
             out["B_inf"] = self.backscatter(feat, img_raw=img_raw)
         return out

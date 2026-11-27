@@ -169,6 +169,6 @@ def splatt3r_head_state(path, view=1):
 
 def load_splatt3r(head, path, view=1):
     """Copies the trained Gaussian head of Splatt3R into head (strict). Returns the number of tensors."""
-    state = splatt3r_head_state(path, view)
+    state = torch.load(path, map_location="cpu") if path.endswith(".pth") else splatt3r_head_state(path, view)
     head.gaussian_dpt.load_state_dict(state, strict=True)
     return len(state)
