@@ -65,6 +65,7 @@ class Localizer:
         self.reproj = float(reproj) if reproj else 0.008 * float(np.hypot(h, w))
         self.pos = None
         self.lean_ok, self.lean_diff, self.half_ok = None, None, None
+        self.trt, self.trt_pos, self.trt_info, self.use_trt = None, None, None, False
 
     def amp(self, half):
         return torch.autocast("cuda", dtype=torch.float16, enabled=bool(half) and self.dev.type == "cuda")
@@ -111,6 +112,10 @@ class Localizer:
 
     @torch.no_grad()
     def encode(self, img, half=False):
+        if self.use_trt and self.trt is not None and tuple(img.shape[-2:]) == tuple(self.trt.hw):
+            f = self.trt(img[None] * 2.0 - 1.0)
+            self.pos = self.trt_pos
+            return f
         with self.amp(half):
             f, pos, _ = self.net._encode_image(img[None] * 2.0 - 1.0, self.shape)
         self.pos = pos

@@ -269,6 +269,9 @@ def main():
     ap.add_argument("--fast_dim", type=int, default=128, help="--gscpe fast path: dimensions of the reduced anchors in the ablation row, 0 leaves the row out")
     ap.add_argument("--no_water_align", dest="water_align", action="store_false",
                     help="--gscpe fast path: leave out the rows that align the query through the water model of the map (tools/loc_water.py)")
+    ap.add_argument("--trt_encoder", action="store_true",
+                    help="--gscpe: build (once, cached in .cache/trt) an FP16 TensorRT engine of the encoder with the LoRA merged, check its tokens "
+                         "against PyTorch and add the fast path rows with it (tools/trt_encoder.py); without TensorRT the rows are left out")
     ap.add_argument("--fast_min_corr", type=float, default=0.25,
                     help="--gscpe fast path: the check accepts a pose when render and query correlate at least this much after the alignment")
     ap.add_argument("--gscpe_depth_m", type=float, default=None,
@@ -1006,6 +1009,13 @@ def main():
         poses_np = c2w.cpu().numpy().astype(np.float64)
         loc = loc_ff.Localizer(net, feat, depth, conf, intr, c2w, focal, pp, args.min_conf_thr, dev, subsample=args.loc_subsample,
                                reproj=args.loc_reproj)
+        if args.trt_encoder and args.gscpe and dev.type == "cuda":
+            try:
+                import trt_encoder
+                trt_encoder.attach(loc, net, args.lora, h, w, dev, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "trt"),
+                                   [imgs[i] for i in range(min(3, n))], log=lambda m: print(m, flush=True))
+            except Exception as e:
+                print(f"[trt] the TensorRT encoder is not used: {type(e).__name__}: {str(e)[:300]}", flush=True)
         ref_poses, ref_fit, ref_text, ref_src = None, None, None, None
         load_query = lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev)
         if args.ref_register > 0 and held_ref is None:

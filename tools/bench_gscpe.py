@@ -339,6 +339,15 @@ def run(ctx):
             except Exception as e:
                 res["notes"].append("%s failed: %s: %s" % (label, type(e).__name__, e))
 
+        def with_trt(fn):
+            def run(im):
+                loc.use_trt = True
+                try:
+                    return fn(im)
+                finally:
+                    loc.use_trt = False
+            return run
+
         timed("no render, descriptor branch only", "lean", lambda im: loc.localize(im, topk=1, lean=True), "lean")
         if half:
             timed("no render, branch only, half prec.", "lean", lambda im: loc.localize(im, topk=1, lean=True, half=True), "lean_half")
@@ -348,6 +357,11 @@ def run(ctx):
             timed("fast + check, half precision", "fast", lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, half=True, **fk), "tiered_half")
         if ctx.get("ablation", True):
             timed("fast, render without the water model", "fast", lambda im: LF.localize_fast(loc, im, at("restored"), **fk))
+        if getattr(loc, "trt", None) is not None:
+            info["trt"] = dict(loc.trt_info)
+            timed("fast: TensorRT encoder", "trt", with_trt(lambda im: LF.localize_fast(loc, im, at("underwater"), **fk)), "trt_fast")
+            timed("fast + check, TensorRT encoder", "trt",
+                  with_trt(lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, half=half, **fk)), "trt_tiered")
         if ctx.get("loc_public") is not None:
             timed("public MASt3R: tokens, PnP, alignment", "public", lambda im: LF.localize_fast(ctx["loc_public"], im, at("underwater"), **fk))
         if anchors is not None:
@@ -428,7 +442,7 @@ def table(rows, key_t, key_acc, unit):
 KEY_ROWS = ("no render: match the map frame, PnP", "coarse: render, match, PnP", "refine: + masked warping", "fast: tokens, PnP, direct alignment",
             "fast + check (decoder when it fails)", "fast + check, half precision", "anchors: map tokens in 3D, alignment",
             "anchors + check (decoder if it fails)", "anchors + check, half precision", "anchors: water aligned", "anchors + check: water aligned",
-            "anchors + check, water, half prec.")
+            "anchors + check, water, half prec.", "fast: TensorRT encoder", "fast + check, TensorRT encoder")
 
 
 def in_short(res, info):
@@ -517,7 +531,8 @@ def report(res, info):
               "             pyramid levels 1/%s, no network. The check accepts the result or sends the query through the decoder (descriptor branch only)." % (
                   ", 1/".join(str(2 ** int(x)) for x in o["levels"]))]
         ms = lambda d, k: 1e3 * d["stages"].get(k, 0.0)
-        for key, name in (("fast", "fast"), ("tiered", "fast + check"), ("tiered_half", "fast + check, half precision")):
+        for key, name in (("fast", "fast"), ("tiered", "fast + check"), ("tiered_half", "fast + check, half precision"), ("trt_fast", "fast, TensorRT encoder"),
+                          ("trt_tiered", "fast + check, TensorRT")):
             d = fa.get(key)
             if not d:
                 continue
@@ -537,6 +552,11 @@ def report(res, info):
             if an.get("low_dim"):
                 L.append("   In %d dimensions (principal directions of the anchors, %.0f %% of the energy) the anchors take %.1f MB." % (
                     an["low_dim"], 100.0 * an["low_kept"], an["low_mb"]))
+        tr = fa.get("trt")
+        if tr:
+            L.append("   TensorRT encoder: FP16 engine of the encoder with the LoRA merged (%s), tokens against PyTorch cosine mean %.5f, lowest %.4f, "
+                     "encoder %.1f ms against %.1f ms in PyTorch" % ("built in %.0f s" % tr["seconds_build"] if tr.get("built") else "cached engine",
+                                                                     tr["cos_mean"], tr["cos_min"], tr["ms_trt"], tr["ms_torch"]))
         wa = fa.get("water_cfg")
         if wa:
             L += ["   Water aligned: one render of the in air colour, depth and opacity of the map at the PnP pose (half resolution when the levels allow it),",

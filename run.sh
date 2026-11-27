@@ -72,6 +72,7 @@ if [ "$HOLD" != 0 ]; then
     fi
     echo "reference of the queries: registration into the fixed map, matcher $RM"
     EXTRA=(--split_json "$SD/split.json" --ref_register "${REF_K:-6}" --ref_matcher "$RM" --proto_ref_frames 2)
+    [ "${TRT:-0}" = 1 ] && EXTRA+=(--trt_encoder)
   else
     MP="$SD"
     echo "mapping frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($SPLIT), $NQ queries, pair window $WIN; the reference is moved in from another reconstruction of all frames"
