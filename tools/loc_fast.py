@@ -199,8 +199,12 @@ def rodrigues(w):
     return np.eye(3) + np.sin(th) / th * k + (1.0 - np.cos(th)) / (th * th) * k @ k
 
 
-def direct_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3), photo="lcn", min_alpha=0.5, tol=1e-4, sync_fn=None):
+def direct_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3), photo="lcn", min_alpha=0.5, tol=1e-4, sync_fn=None, backend="auto"):
     dev = query.device
+    if photo == "lcn" and backend != "torch":
+        import loc_water as LW
+        if backend == "ext" or LW.self_check(dev):
+            return LW.lcn_align(query, pose, K, render_rgbd, levels=levels, iters=iters, min_alpha=min_alpha, tol=tol, sync_fn=sync_fn)
     sync_fn = sync_fn or (lambda: None)
     pose = np.asarray(pose, dtype=np.float64)
     sec = dict(render=0.0, align=0.0)
@@ -291,7 +295,7 @@ def direct_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3),
     good = bool(np.isfinite(new).all()) and steps > 0
     ang = float(np.degrees(np.arccos(np.clip(0.5 * (np.trace(R) - 1.0), -1.0, 1.0))))
     out.update(pose=new if good else pose, ok=good, corr=corr, valid=float(valid), steps=steps, last=last, seconds=float(sum(sec.values())),
-               shift=[float(np.linalg.norm(t) / scale), ang])
+               shift=[float(np.linalg.norm(t) / scale), ang], backend="torch")
     return out
 
 

@@ -167,6 +167,66 @@ def self_check(dev):
     return ok
 
 
+def centred_corr(q, m):
+    am, qm = m - m.mean(1, keepdim=True), q - q.mean(1, keepdim=True)
+    return float((am * qm).sum() / (am.norm() * qm.norm()).clamp_min(1e-12))
+
+
+def lcn_align(query, pose, K, render_rgbd, levels=(3, 2, 1), iters=(5, 4, 3), min_alpha=0.5, tol=1e-4, sync_fn=None, huber_k=1.345):
+    sync_fn = sync_fn or (lambda: None)
+    pose = np.asarray(pose, dtype=np.float64)
+    sec = dict(render=0.0, align=0.0)
+    sync_fn()
+    a = time.time()
+    with torch.no_grad():
+        img, alpha, depth = render_rgbd(pose)
+        img = img.clamp(0.0, 1.0)
+    sync_fn()
+    sec["render"] = time.time() - a
+    out = dict(pose=pose, ok=False, corr=None, valid=0.0, steps=0, stages=sec, seconds=sec["render"], shift=None, backend="ext")
+    ok = (alpha > min_alpha) & torch.isfinite(depth) & (depth > 1e-6)
+    if int(ok.sum()) < 64:
+        return out
+    a = time.time()
+    scale = float(depth[ok].median())
+    dz = torch.where(ok, depth, torch.zeros_like(depth))
+    St = start_state()
+    steps, last, n_use, hl, q, m, use = 0, None, 0, (1, 1), None, None, None
+    with torch.no_grad():
+        for s, n_it in zip(levels, iters):
+            s = int(s)
+            if min(query.shape[-2:]) // (2 ** s) < 12:
+                continue
+            fx, fy, cx, cy = Wp.level_intrinsics(K, s)
+            Q = LF.contrast(Wp.pool_image(query.float(), s))
+            A = LF.contrast(Wp.pool_image(img.float(), s))
+            d, mk = Wp.pool_depth(dz, ok, s)
+            sel = mk.reshape(-1)
+            X = Wp.backproject(d, (fx, fy, cx, cy)).reshape(-1, 3)[sel].contiguous()
+            if X.shape[0] < 64:
+                continue
+            Iv = A.reshape(1, -1)[:, sel].contiguous()
+            z0 = X[:, 2].contiguous()
+            res = align_level("ext", gradients(Q), X, Iv, torch.zeros_like(Iv), z0, torch.as_tensor(St, dtype=torch.float64), fx, fy, cx, cy, scale, False,
+                              float(huber_k), int(n_it), float(tol), 64)
+            St, (st, la, nu, _), q, m, use = res
+            steps += st
+            last = la if st else last
+            n_use, hl = nu, Q.shape[-2:]
+    sync_fn()
+    sec["align"] = time.time() - a
+    corr = centred_corr(q[:, use], m[:, use]) if (q is not None and use is not None and int(use.sum()) > 8) else None
+    R, t = St[:9].reshape(3, 3), St[9:12]
+    d4 = np.eye(4)
+    d4[:3, :3], d4[:3, 3] = R, t
+    new = pose @ np.linalg.inv(d4)
+    good = bool(np.isfinite(new).all()) and steps > 0
+    ang = float(np.degrees(np.arccos(np.clip(0.5 * (np.trace(R) - 1.0), -1.0, 1.0))))
+    out.update(pose=new if good else pose, ok=good, corr=corr, valid=float(n_use) / float(hl[0] * hl[1]), steps=steps, last=last,
+               seconds=float(sum(sec.values())), shift=[float(np.linalg.norm(t) / scale), ang])
+    return out
+
+
 def slopes(Jv, Bv, z0, betas, eps=1e-3):
     bD, bB = [x.float() for x in betas(z0)]
     z1 = z0 * (1.0 + eps)
@@ -225,14 +285,16 @@ def water_align(query, pose, K, parts, levels=(3, 2, 1), iters=(5, 4, 3), transp
             steps += st
             last = la if st else last
             n_use, hl = nu, Q.shape[-2:]
+            last_level = (Q, Il, sel, X, z0, (fx, fy, cx, cy))
     sync_fn()
     sec["align"] = time.time() - a
     corr = None
     if q is not None and use is not None and int(use.sum()) > 8:
-        g = torch.as_tensor(St[12:12 + q.shape[0]], dtype=q.dtype, device=q.device)[:, None]
-        qa, ma = g * q[:, use], m[:, use]
-        am, qm = ma - ma.mean(1, keepdim=True), qa - qa.mean(1, keepdim=True)
-        corr = float((am * qm).sum() / (am.norm() * qm.norm()).clamp_min(1e-12))
+        Q, Il, sel, X, z0, intr = last_level
+        Il1 = LF.contrast(Il).reshape(1, -1)[:, sel].contiguous()
+        e = evaluate_torch(gradients(LF.contrast(Q)), X, Il1, torch.zeros_like(Il1), z0, np.r_[St[:12], np.ones(3)], *intr, False)
+        if e["n_use"] > 8:
+            corr = centred_corr(e["q"][:, e["use"]], e["m"][:, e["use"]])
     R, t = St[:9].reshape(3, 3), St[9:12]
     d4 = np.eye(4)
     d4[:3, :3], d4[:3, 3] = R, t

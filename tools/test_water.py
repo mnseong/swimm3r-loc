@@ -149,6 +149,32 @@ def check_corr():
     assert abs(per) < 0.1 and pooled > 0.9
 
 
+def check_lcn_ext():
+    K, hw = G.intrinsics(FOCAL, PP), (H, W_)
+    gen = torch.Generator().manual_seed(12)
+    v, u = torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W_, dtype=torch.float32), indexing="ij")
+    res = {"ext": [], "torch": [], "start": []}
+    secs = {"ext": [], "torch": []}
+    for i in (6, 12, 18, 24, 30):
+        true = T.true_pose(i)
+        with torch.no_grad():
+            clean = TF.textured(true)[0]
+            query = (0.8 * clean + 0.06 + 0.05 * (u / W_)[None] + 0.01 * torch.randn(3, H, W_, generator=gen)).clamp(0.0, 1.0)
+            pts = T.surface_points(tt(true))[0].reshape(-1, 3)[::37].double().numpy()
+        for seed, (tr, rd) in enumerate(((0.01, 0.3), (0.02, 0.8))):
+            start = G.perturb(true, tr * DEPTH, rd, np.random.default_rng(10 * i + seed))
+            res["start"].append(G.pixel_shift(K, true, start, pts, hw))
+            for be in ("ext", "torch"):
+                r = LF.direct_align(query, start, K, TF.textured, levels=(2, 1, 0), iters=(6, 4, 3), photo="lcn", backend=be)
+                assert r["ok"] and r["backend"] == be and r["corr"] is not None, r
+                res[be].append(G.pixel_shift(K, true, r["pose"], pts, hw))
+                secs[be].append(r["stages"]["align"])
+    med = {k: float(np.median(v)) for k, v in res.items()}
+    print("locally normalised direct alignment, C++ steps %.3f px (largest %.3f) in %.0f ms against PyTorch steps %.3f px (largest %.3f) in %.0f ms, start %.2f px" % (
+        med["ext"], max(res["ext"]), 1e3 * np.mean(secs["ext"]), med["torch"], max(res["torch"]), 1e3 * np.mean(secs["torch"]), med["start"]))
+    assert med["ext"] < 0.15 and max(res["ext"]) < 0.5, res
+
+
 def check_transport():
     K = G.intrinsics(FOCAL, PP)
     gen = torch.Generator().manual_seed(5)
@@ -278,6 +304,7 @@ if __name__ == "__main__":
     check_steps_match()
     check_water_align()
     check_corr()
+    check_lcn_ext()
     check_transport()
     check_fast_path()
     check_bench()
