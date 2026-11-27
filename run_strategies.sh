@@ -2,11 +2,11 @@
 set -uo pipefail
 D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$D"
-M="${1:-v13c}"
+M="${1:-v17}"
 OUT="${2:-out}"
 case "$M" in
-  v13c) ;;
-  *) echo "usage: [TAG=name] [WIN=5] [GAP_BLOCKS='6 9'] [SEALOC=data/sealoc_s1] [SEALOC_DEPTH_M=2.05] run_strategies.sh [v13c] [out_dir] [more options of tools/stage1_splatt3r.py for every step]"
+  v17|v13c) ;;
+  *) echo "usage: [TAG=name] [WIN=5] [GAP_BLOCKS='6 9'] [SEALOC=data/sealoc_s1] [SEALOC_DEPTH_M=2.05] run_strategies.sh [v17|v13c] [out_dir] [more options of tools/stage1_splatt3r.py for every step]"
      echo "three steps one after another with HF_HUB_OFFLINE=1, a step that fails does not stop the next"
      echo "  1 video1, HOLD=12 BLOCK=3 (run_gscpe.sh), with pose verification, the viewpoint gap experiment and the medium adapted to the query"
      echo "  2 run_gap.sh on the sparser maps rebuilt from fewer map frames (BLOCK 6 and 9 of every 12)"

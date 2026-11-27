@@ -2,15 +2,16 @@
 set -euo pipefail
 D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$D"
-M="${1:-v13c}"
+M="${1:-v17}"
 OUT="${2:-out}"
 case "$M" in
-  v13c) W0=ckpt/joint_s3r_v12/weights; H0=ckpt/head_s3r_v13c/final_splatt3r.pth ;;
-  *) W0=""; H0="" ;;
+  v17) W0=ckpt/joint_s3r_v17/weights; H0=ckpt/head_s3r_v17/final_splatt3r.pth; E0=0015 ;;
+  v13c) W0=ckpt/joint_s3r_v12/weights; H0=ckpt/head_s3r_v13c/final_splatt3r.pth; E0=0019 ;;
+  *) W0=""; H0=""; E0=0019 ;;
 esac
 W="${WEIGHTS:-$W0}"
-LORA="${LORA:-$W/0019_lora.pth}"
-PHYS="${PHYS:-$W/0019_physics.pth}"
+LORA="${LORA:-$W/${E0}_lora.pth}"
+PHYS="${PHYS:-$W/${E0}_physics.pth}"
 H="${HEAD:-$H0}"
 TAG0="${TAG:-}"
 TAG="${TAG:+_$TAG}"
@@ -18,8 +19,8 @@ SCENE="${SCENE:-data/video1}"
 SCENE="${SCENE%/}"
 LOC=(--anchor_px 6 --min_conf_thr 0.5 --fps 5 --medium_raster s2 --binf_veil)
 case "$M" in
-  v13c) ;;
-  *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses SCENE=folder FIXED_SPLIT=1] run.sh [v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; echo "SCENE=data/sealoc_s1 (default data/video1) takes the images and splits of another scene folder, its name is added to the output folders. FIXED_SPLIT=1 maps the train_files.txt of the scene and localizes the test_files of its split.json, the reference REF of all frames is moved into the map through a similarity on the map frames (HOLD_MAP=moved)"; exit 1 ;;
+  v17|v13c) ;;
+  *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses SCENE=folder FIXED_SPLIT=1] run.sh [v17|v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; echo "SCENE=data/sealoc_s1 (default data/video1) takes the images and splits of another scene folder, its name is added to the output folders. FIXED_SPLIT=1 maps the train_files.txt of the scene and localizes the test_files of its split.json, the reference REF of all frames is moved into the map through a similarity on the map frames (HOLD_MAP=moved)"; exit 1 ;;
 esac
 if [ "$(cd "$SCENE" 2>/dev/null && pwd -P)" != "$(cd "$D/data/video1" 2>/dev/null && pwd -P)" ]; then
   [ -d "$SCENE/images" ] || { echo "no images at $SCENE/images (SCENE=$SCENE)"; exit 1; }

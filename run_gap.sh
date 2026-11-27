@@ -2,11 +2,11 @@
 set -uo pipefail
 D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$D"
-M="${1:-v13c}"
+M="${1:-v17}"
 OUT="${2:-out}"
 case "$M" in
-  v13c) ;;
-  *) echo "usage: [GAP_BLOCKS='3 6 9'] [GAP_PRIORS='2:0 5:0 10:0 20:0 0:2 0:5 0:10'] [GAP_SEED=0] [GAP_QUERIES=0] run_gap.sh [v13c] [out_dir] [more options of tools/stage1_splatt3r.py]"
+  v17|v13c) ;;
+  *) echo "usage: [GAP_BLOCKS='3 6 9'] [GAP_PRIORS='2:0 5:0 10:0 20:0 0:2 0:5 0:10'] [GAP_SEED=0] [GAP_QUERIES=0] run_gap.sh [v17|v13c] [out_dir] [more options of tools/stage1_splatt3r.py]"
      echo "HOLD=12 with BLOCK=3, 6 and 9 consecutive queries of every 12 frames: every split gets its own Stage 1 of its map frames alone (run.sh, HOLD_MAP=register),"
      echo "its own map and output folder, the GS-CPE benchmark (run_gscpe.sh) and the gap experiment (tools/bench_gap.py, gap.txt and gap.json next to gscpe.json)"; exit 1 ;;
 esac

@@ -358,7 +358,7 @@ def check_run_strategies():
     tail = o[o.index("strategies done"):]
     assert tail.index("SHORT ONE") < tail.index("SHORT SIX") < tail.index("SHORT THREE"), tail
     q = subprocess.run(["bash", os.path.join(d, "run_strategies.sh")], cwd="/", env=dict(env, GAP_BLOCKS="9"), capture_output=True, text=True)
-    assert q.returncode == 0 and "step 2 done" in q.stdout and "v13c_hold12b9w5_loftr" in q.stdout, (q.returncode, q.stdout)
+    assert q.returncode == 0 and "step 2 done" in q.stdout and "v17_hold12b9w5_loftr" in q.stdout, (q.returncode, q.stdout)
     assert open(os.path.join(d, "calls.txt")).read().strip().split("\n")[4].split("|")[9] == "9"
     print("run_strategies.sh with stand ins for the launchers: three steps in order with HF_HUB_OFFLINE=1, a failed step does not stop the next, "
           "every gscpe.txt is named and the short blocks are printed again at the end")
