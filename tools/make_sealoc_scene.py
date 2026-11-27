@@ -271,7 +271,8 @@ def heading_gap(a, b):
 
 def select(args, poses, prints):
     mrows, fp = survey_rows(poses, prints, args.map_survey)
-    qrows, _ = survey_rows(poses, prints, args.query_survey)
+    same = args.query_survey == args.map_survey
+    qrows = mrows if same else survey_rows(poses, prints, args.query_survey)[0]
     if len(mrows) < args.n_map:
         raise SystemExit("the map survey has %d left images with a pose and a footprint" % len(mrows))
     lon0 = float(np.mean([float(r["longitude"]) for r in mrows]))
@@ -288,19 +289,43 @@ def select(args, poses, prints):
     mc = np.array([p.mean(0) for p in mp])
     qc = np.array([p.mean(0) for p in qp])
     t = np.array([ts(r) for r in mrows])
-    ok_start = [i for i in range(len(mrows) - args.n_map + 1) if float(np.diff(t[i:i + args.n_map]).max()) <= args.max_gap]
+    tq = np.array([ts(r) for r in qrows])
+    yaw = np.array([float(r["yaw"]) for r in mrows])
+    turn = np.array([heading_gap(yaw[j + 1], yaw[j]) for j in range(len(mrows) - 1)] + [0.0])
+    ok_start = []
+    for i in range(len(mrows) - args.n_map + 1):
+        if float(np.diff(t[i:i + args.n_map]).max()) > args.max_gap:
+            continue
+        if args.max_turn > 0 and float(turn[i:i + args.n_map - 1].max()) > args.max_turn:
+            continue
+        if args.max_drift > 0 and max(heading_gap(a, yaw[i]) for a in yaw[i:i + args.n_map]) > args.max_drift:
+            continue
+        ok_start.append(i)
     if not ok_start:
-        raise SystemExit("no run of %d map images without a gap above %.1f s" % (args.n_map, args.max_gap))
+        raise SystemExit("no run of %d map images without a gap above %.1f s, a turn above %.1f deg per frame and a heading drift above %.1f deg" % (
+            args.n_map, args.max_gap, args.max_turn, args.max_drift))
+    print("[sealoc] %d possible map runs of %d frames (gap at most %.1f s%s%s)" % (
+        len(ok_start), args.n_map, args.max_gap, ", turn at most %.1f deg per frame" % args.max_turn if args.max_turn > 0 else "",
+        ", heading within %.1f deg of the first frame" % args.max_drift if args.max_drift > 0 else ""), flush=True)
+
+    def allowed(k, i):
+        if not same:
+            return True
+        return tq[k] < t[i] - args.control_dt or tq[k] > t[i + args.n_map - 1] + args.control_dt
+
+    def usable(k, i, near):
+        j = int(near[int(np.argmax([iou(qp[k], mp[jj]) for jj in near]))])
+        return heading_gap(float(qrows[k]["yaw"]), float(mrows[j]["yaw"])) <= args.max_heading
     reach = 0.5 * float(np.median([np.ptp(p, 0).max() for p in mp])) * 2.0
     best = None
     for i in ok_start[::max(1, args.n_map // 10)]:
         lo, hi = mc[i:i + args.n_map].min(0) - reach, mc[i:i + args.n_map].max(0) + reach
-        cand = [k for k in range(len(qrows)) if (qc[k] >= lo).all() and (qc[k] <= hi).all()]
+        cand = [k for k in range(len(qrows)) if (qc[k] >= lo).all() and (qc[k] <= hi).all() and allowed(k, i)]
         n_ok = 0
         for k in cand:
             d = np.linalg.norm(mc[i:i + args.n_map] - qc[k], axis=1)
             near = np.argsort(d)[:6] + i
-            if max(iou(qp[k], mp[j]) for j in near) >= args.min_iou:
+            if max(iou(qp[k], mp[j]) for j in near) >= args.min_iou and usable(k, i, near):
                 n_ok += 1
         if best is None or n_ok > best[1]:
             best = (i, n_ok)
@@ -313,10 +338,11 @@ def select(args, poses, prints):
         lo_, hi_ = mc[i:i + args.n_map].min(0) - reach, mc[i:i + args.n_map].max(0) + reach
         n_ok = 0
         for k in range(len(qrows)):
-            if not ((qc[k] >= lo_).all() and (qc[k] <= hi_).all()):
+            if not ((qc[k] >= lo_).all() and (qc[k] <= hi_).all()) or not allowed(k, i):
                 continue
             d = np.linalg.norm(mc[i:i + args.n_map] - qc[k], axis=1)
-            if max(iou(qp[k], mp[j]) for j in np.argsort(d)[:6] + i) >= args.min_iou:
+            near = np.argsort(d)[:6] + i
+            if max(iou(qp[k], mp[j]) for j in near) >= args.min_iou and usable(k, i, near):
                 n_ok += 1
         if n_ok > best[1]:
             best = (i, n_ok)
@@ -324,11 +350,13 @@ def select(args, poses, prints):
     msel = list(range(i0, i0 + args.n_map))
     info = []
     for k in range(len(qrows)):
+        if not allowed(k, i0):
+            continue
         d = np.linalg.norm(mc[i0:i0 + args.n_map] - qc[k], axis=1)
         near = np.argsort(d)[:8] + i0
         ious = [iou(qp[k], mp[j]) for j in near]
         j = int(near[int(np.argmax(ious))])
-        if max(ious) >= args.min_iou:
+        if max(ious) >= args.min_iou and heading_gap(float(qrows[k]["yaw"]), float(mrows[j]["yaw"])) <= args.max_heading:
             yq, ym = float(qrows[k]["yaw"]), float(mrows[j]["yaw"])
             jn = int(np.argmin(d)) + i0
             info.append(dict(k=k, iou=float(max(ious)), best=j, nearest=jn, dist=float(d.min()),
@@ -456,6 +484,11 @@ def main():
     ap.add_argument("--gamma", type=float, default=2.2)
     ap.add_argument("--quality", type=int, default=92)
     ap.add_argument("--query_base", type=int, default=100000)
+    ap.add_argument("--max_turn", type=float, default=0.0, help="largest heading change between consecutive map frames in deg, 0 for any")
+    ap.add_argument("--max_drift", type=float, default=0.0, help="largest heading difference of a map frame to the first map frame in deg, 0 for any")
+    ap.add_argument("--max_heading", type=float, default=180.0, help="largest heading difference of a query to its best overlapping map frame in deg")
+    ap.add_argument("--control_dt", type=float, default=60.0,
+                    help="with --query_year equal to --map_year: queries of the same survey at least this many seconds before or after the map run")
     ap.add_argument("--select_only", action="store_true")
     args = ap.parse_args()
     dl = os.path.abspath(args.dl)
@@ -532,7 +565,7 @@ def main():
     for (stem, r, sv, kind), n in zip(items, names):
         ref[n] = dict(c2w=pose_c2w(r, enu, cv).tolist(), label=r["camera_label"], survey=sv, kind=kind)
     json.dump(ref, open(os.path.join(out, "reference_poses.json"), "w"), indent=1)
-    json.dump(dict(split_mode="cross_visit", map_survey=args.map_survey, query_survey=args.query_survey, n_train_views=len(mnames), n_test_views=len(qnames),
+    json.dump(dict(split_mode="same_survey" if args.query_survey == args.map_survey else "cross_visit", map_survey=args.map_survey, query_survey=args.query_survey, n_train_views=len(mnames), n_test_views=len(qnames),
                    all_files=names, train_files=mnames, test_files=qnames, centre_files=[]), open(os.path.join(out, "split.json"), "w"), indent=1)
     open(os.path.join(out, "train_files.txt"), "w").write("\n".join(mnames) + "\n")
     qinfo = []

@@ -314,7 +314,8 @@ def check_run_sh():
     assert hm["code"] == 1 and "HOLD_MAP=moved only" in hm["out"] and not hm["calls"], hm
     ho = launch(new, {"SCENE": "data/sealoc_s1", "HOLD": "12", "BLOCK": "3", "REF_MATCHER": "loftr"}, ["v13c", "out", "--gscpe"])
     assert ho["code"] == 0 and "--outdir out/map_v13c_sealoc_s1_hold12b3w5 " in ho["calls"][0] and "--out_dir out/v13c_sealoc_s1_hold12b3w5_loftr/loc " in ho["calls"][1]
-    assert len(ho["files"]["out/map_v13c_sealoc_s1_hold12b3w5/all.txt"].split()) == 114 and "--data_dir data/sealoc_s1 " in ho["calls"][1]
+    n_sl = len([x for x in os.listdir(os.path.join(ROOT, "data", "sealoc_s1", "images")) if x.endswith(".jpg")])
+    assert len(ho["files"]["out/map_v13c_sealoc_s1_hold12b3w5/all.txt"].split()) == n_sl and "--data_dir data/sealoc_s1 " in ho["calls"][1]
     mv = launch(new, {"SCENE": "data/sealoc_s1", "HOLD": "12", "HOLD_MAP": "moved"}, ["v13c", "out"])
     assert mv["code"] == 1 and "--imagedir data/sealoc_s1/images --outdir out/map_v13c_sealoc_s1_all " in mv["calls"][0] and \
         "no reference mapping at out/map_v13c_sealoc_s1_all" in mv["out"], mv
