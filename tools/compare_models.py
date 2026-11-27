@@ -33,7 +33,7 @@ W = 118
 L = ["=" * W, " Splatt3R against ours with the same localization code, Barbados videos 1 to 4, GS-CPE split (3 of every 12 frames are queries, never mapped),",
      " reference: LoFTR registration of every query into the map of that model, errors in percent of the median map depth", "-" * W]
 L.append(" queries scored   " + " | ".join("%-18s %s" % (lab, " ".join(f((res[(m, v)] or {}).get("frames"), "%3d") for v in VIDEOS)) for m, lab in MODELS))
-L.append(" per scene: FPS (1 / mean seconds per query), then queries within 5 %% and 5 deg | mean of the four scenes: FPS, within 5/5, within 2/2, median %%, deg")
+L.append(" per scene: FPS (1 / mean seconds per query), then queries within 5 % and 5 deg | mean of the four scenes: FPS, within 5/5, within 2/2, median %, deg")
 L.append(" %-38s %-20s %s | %s | %6s %6s %6s %6s %6s" % ("method", "model", " ".join("%5s" % v.replace("video", "v") for v in VIDEOS),
                                                       " ".join("%5s" % v.replace("video", "v") for v in VIDEOS), "FPS", "5/5", "2/2", "t %", "deg"))
 for lab in KEY_ROWS:
