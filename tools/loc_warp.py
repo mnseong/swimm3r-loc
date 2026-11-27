@@ -39,7 +39,8 @@ def project(x, intr):
 
 def sample(img, u, v):
     h, w = img.shape[-2:]
-    grid = torch.stack([2.0 * u / max(w - 1, 1) - 1.0, 2.0 * v / max(h - 1, 1) - 1.0], -1)[None]
+    u, v = u.clamp(-2.0, w + 1.0), v.clamp(-2.0, h + 1.0)
+    grid =torch.stack([2.0 * u / max(w - 1, 1) - 1.0, 2.0 * v / max(h - 1, 1) - 1.0], -1)[None]
     return F.grid_sample(img[None], grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0]
 
 

@@ -124,7 +124,7 @@ def map_stats(g, c2w, fnums, fps, focal):
                 faint_wide_parent=float(faint[par].float().mean()) if bool(par.any()) else 0.0, quarter_edges=[float(x) for x in q])
 
 
-def main():
+def parser():
     ap = argparse.ArgumentParser(description="Splatt3R Gaussian map of a Stage 1 output with the physics coupling")
     ap.add_argument("--scene_dir", required=True)
     ap.add_argument("--data_dir", default=None)
@@ -276,6 +276,34 @@ def main():
                     help="--gscpe fast path: the check accepts a pose when render and query correlate at least this much after the alignment")
     ap.add_argument("--gscpe_depth_m", type=float, default=None,
                     help="--gscpe: median depth of the map in metres when it is known, the table is then also given in cm")
+    ap.add_argument("--verify_bench", "--verify", dest="verify", action="store_true",
+                    help="--gscpe: pose verification after the benchmark (tools/bench_verify.py), candidate poses of every scored query checked with "
+                         "and without the Gaussian map, saved as verify.txt and verify.json, appended to gscpe.txt")
+    ap.add_argument("--verify_cap", type=int, default=16, help="--verify_bench: candidate poses per query")
+    ap.add_argument("--verify_seed", type=int, default=0, help="--verify_bench: seed of the perturbed poses, the far map frames and the query resampling")
+    ap.add_argument("--verify_boot", type=int, default=1000, help="--verify_bench: draws of the queries for the intervals, 0 leaves them out")
+    ap.add_argument("--verify_checks", nargs="+", default=None,
+                    choices=["a_tok", "a_dec", "b", "c", "d", "e", "b_rgb", "c_rgb", "d_rgb", "e_rgb", "f", "g", "h"],
+                    help="--verify_bench: checks to compute, all by default")
+    ap.add_argument("--gap_bench", action="store_true",
+                    help="--gscpe: also the viewpoint gap experiment (tools/bench_gap.py), every row against a second reference lifted by the depth of "
+                         "the Gaussian map, the queries without a reference, accuracy by the distance to the nearest map frame and a simulated "
+                         "navigation prior sweep, saved as gap.txt and gap.json, appended to gscpe.txt")
+    ap.add_argument("--gap_priors", nargs="+", default=["2:0", "5:0", "10:0", "20:0", "0:2", "0:5", "0:10"],
+                    help="--gap_bench: errors of the simulated navigation prior as T:R, T in %% of the median depth, R in deg, both 0 or below 0 is refused")
+    ap.add_argument("--gap_seed", type=int, default=0, help="--gap_bench: seed of the direction of the simulated prior error of every query")
+    ap.add_argument("--gap_queries", type=int, default=0, help="--gap_bench: at most this many evenly spaced queries in the prior sweep, 0 all")
+    ap.add_argument("--medium_adapt", "--gscpe_medium", dest="medium_adapt", action="store_true",
+                    help="--gscpe: also the rows that adapt only the medium to the query (tools/bench_medium.py), the Gaussians and their in air colour "
+                         "stay fixed, saved as medium.txt and medium.json, appended to gscpe.txt")
+    ap.add_argument("--gscpe_medium_bound", type=float, default=3.0, help="--medium_adapt: every scale of the water stays within this factor of 1")
+    ap.add_argument("--gscpe_medium_prior", type=float, default=0.02, help="--medium_adapt: weight of the pull of the log scales towards 0")
+    ap.add_argument("--gscpe_medium_min_reg", type=float, default=0.4,
+                    help="--medium_adapt: the water is fitted only when the locally normalised query and render correlate at least this much, not to "
+                         "be tuned on the evaluated queries")
+    ap.add_argument("--gscpe_ref_metric", action="store_true",
+                    help="--medium_adapt: the poses of --proto_ref_poses are in metres, the median depth of the map in metres then follows from the "
+                         "similarity between the reference and the map")
     ap.add_argument("--map_holdout", default=None,
                     help="ground truth as GS-CPE takes it (COLMAP or SLAM poses of all images, the map trained on the training images only): "
                          "--scene_dir is the Stage 1 output of all frames, the test_files of this split are left out of the Gaussian map, "
@@ -294,9 +322,17 @@ def main():
                     help="--proto and --gscpe: reference poses of all frames from another reconstruction, a COLMAP model (folder, images.bin "
                          "or images.txt) or a json of name to camera to world 4 x 4, moved into this map like --proto_ref_scene")
     ap.add_argument("--device", default="cuda")
+    return ap
+
+
+def main():
+    ap = parser()
     args = ap.parse_args()
+    if (args.verify or args.gap_bench or args.medium_adapt) and not args.gscpe:
+        print("[strategies] --verify_bench, --gap_bench and --medium_adapt run only after --gscpe, they are left out of this run", flush=True)
     os.makedirs(args.out_dir, exist_ok=True)
     dev = torch.device(args.device)
+    sync = (lambda: torch.cuda.synchronize(dev)) if dev.type == "cuda" else (lambda: None)
     t0 = time.time()
 
     sc = E.load_scene(args.scene_dir, dev, clean_depth=not args.no_clean_depth)
@@ -371,6 +407,8 @@ def main():
     observed = anchor is not None and getattr(anchor, "opt", {}).get("colour_base", "restored") == "observed"
     if observed and args.phys_beta_D_scale is not None:
         ap.error("this head was trained on the water of the physics head as it is: no --phys_beta_D_scale")
+    sync()
+    t_load = time.time() - t0
 
     with torch.no_grad():
         if anchor is not None:
@@ -548,6 +586,7 @@ def main():
                 return pixel_map({k: v[sel_] for k, v in pr.items()}) if int(sel_.sum()) >= 16 else None
 
             g = pixel_map(pr)
+    sync()
     t_map = time.time() - t0
     print(f"[map] confidence > {args.min_conf_thr}: {n_in / 1e6:.2f}M of {n * h * w / 1e6:.2f}M pixels", flush=True)
     print(f"[map] {n_in / 1e6:.2f}M primitives, {g['n_out'] / 1e6:.2f}M after fusion, offset/depth "
@@ -574,12 +613,14 @@ def main():
 
     want = dict(nearest=["nearest"], field=["field"], views=["views"], both=["nearest", "field"],
                 all=["nearest", "field", "views"])[args.medium]
-    field, views, medium_info = None, None, None
+    field, views, medium_info, t_field = None, None, None, None
     if "field" in want or "views" in want:
         try:
             from model.medium_field import ViewMedium, binf_error, fit_medium_field, held_out_check
             tf = time.time()
             ho = held_out_check(med, c2w, intr, h, w, fnums, iters=args.medium_iters)
+            sync()
+            tfit = time.time()
             obs_w, veil_info = None, None
             if "field" in want and args.binf_veil:
                 from training.physics_splat import veil_terms
@@ -620,21 +661,27 @@ def main():
             if "field" in want:
                 field = (fit_medium_field(med, c2w, intr, h, w, iters=args.medium_iters) if obs_w is None else
                          fit_medium_field(med, c2w, intr, h, w, iters=args.medium_iters, step=8, obs=obs_w, prior=args.binf_prior))
+                sync()
+                t_field = time.time() - tfit
                 torch.save(field.state(), os.path.join(args.out_dir, "medium_field.pt"))
                 if veil_info is not None:
                     veil_info["moved"] = binf_error(field, med, c2w, intr, list(range(n)), h, w)
                     print(f"[medium field] veil fit: B_inf of the field differs from the B_inf of the head by {veil_info['moved']:.4f} on the map frames (mean absolute)", flush=True)
             if "views" in want:
+                tv = time.time()
                 views = ViewMedium(med, c2w, intr, h, w)
-            medium_info = dict(ho, seconds=time.time() - tf)
+                sync()
+                t_field = (t_field or 0.0) + time.time() - tv
+            medium_info = dict(ho, seconds=time.time() - tf, seconds_fit=t_field, seconds_check=tfit - tf)
             if veil_info is not None:
                 medium_info["binf_veil"] = veil_info
             print(f"[medium field] B_inf error on {ho['n_left_out']} left out map frames: field {ho['field']:.4f}, views "
                   f"{ho['views']:.4f}, mean of the two nearest frames {ho['nearest']:.4f} | spread over the frames of params_D "
-                  f"{ho['spread_params_D']:.4f}, of B_inf {ho['spread_binf']:.4f} | {medium_info['seconds']:.0f}s", flush=True)
+                  f"{ho['spread_params_D']:.4f}, of B_inf {ho['spread_binf']:.4f} | fit of the medium {t_field or 0.0:.0f} s (counted in the mapping), "
+                  f"held out check {tfit - tf:.0f} s (not counted)", flush=True)
         except Exception as e:
             print(f"[medium field] failed, only the medium of the nearest frames is scored: {type(e).__name__}: {e}", flush=True)
-            field, views = None, None
+            field, views, t_field = None, None, None
     modes = [m for m in want if m == "nearest" or (m == "field" and field is not None) or (m == "views" and views is not None)]
     if not modes:
         modes = ["nearest"]
@@ -762,7 +809,7 @@ def main():
             bD_, bB_ = beta_at(phys, m_, zz)
             return bD_.float(), bB_.float()
 
-        return dict(I=I_, J=J_.clamp_min(0.0), alpha=a_.reshape(h // k_, w // k_), depth=z_, binf=B_, betas=betas_, level=0 if k_ == 1 else 1)
+        return dict(I=I_, J=J_.clamp_min(0.0), alpha=a_.reshape(h // k_, w // k_), depth=z_, binf=B_, betas=betas_, level=0 if k_ == 1 else 1, medium=m_)
 
     def refine(p0, gt, m1, t=None):
         if args.pose_iters <= 0:
@@ -793,7 +840,8 @@ def main():
                 float(lp(img[None], gt[None]))]
 
     out = {"scene": args.scene_dir, "head": src, "lora": args.lora, "physics": args.physics, "frames_in_map": n,
-           "primitives_before_fusion": n_in, "primitives": g["n_out"], "seconds_map": t_map, "stage1_restored_frames": n_s1,
+           "primitives_before_fusion": n_in, "primitives": g["n_out"], "seconds_map": t_map, "seconds_load": t_load, "seconds_gaussian_map": t_map - t_load,
+           "seconds_medium_field": t_field, "stage1_restored_frames": n_s1,
            "beta_D_scale": args.phys_beta_D_scale, "clean_depth": not args.no_clean_depth, "medium": modes, "medium_primary": modes[0], "medium_field": medium_info, "far_layer": int(g_far["n_out"]) if g_far is not None else 0,
            "medium_raster": args.medium_raster if "beta" in g else "preshade",
            "time_fill": bool(args.time_fill and tmaps),
@@ -1017,13 +1065,14 @@ def main():
             except Exception as e:
                 print(f"[trt] the TensorRT encoder is not used: {type(e).__name__}: {str(e)[:300]}", flush=True)
         ref_poses, ref_fit, ref_text, ref_src = None, None, None, None
+        ref_cache = {} if args.gap_bench else None
         load_query = lambda name: E.load_image(os.path.join(args.scene_dir, "images", name), max(h, w)).to(dev)
         if args.ref_register > 0 and held_ref is None:
             import loc_ref
             rm = loc_ref.loftr_matcher(dev, conf_min=args.ref_loftr_conf) if args.ref_matcher == "loftr" else None
             ref_poses, ref_fit, ref_rows = loc_ref.register_queries(
                 loc, tests, load_query, fnums, E.interpolate_poses(poses_np, [E.fnum(x) for x in tests], fnums), k=args.ref_register,
-                tol=args.proto_ref_tol, matcher=rm, images=imgs if rm is not None else None)
+                tol=args.proto_ref_tol, matcher=rm, images=imgs if rm is not None else None, cache=ref_cache)
             del rm
             ref_text = "every query registered into the fixed map" + (" with LoFTR" if args.ref_matcher == "loftr" else "")
             ref_src = (None, None, "registration into the fixed map", ref_text)
@@ -1092,24 +1141,37 @@ def main():
             print("[gscpe] no reference poses of the queries (--proto_ref_scene or --proto_ref_poses), the GS-CPE protocol is left out", flush=True)
         elif args.gscpe:
             import bench_gscpe
-            gres = bench_gscpe.run(dict(
+            import bench_strategies
+            gctx = dict(
                 dev=dev, tests=tests, fps=args.fps, warmup=args.bench_warmup, map_nums=fnums, load=load_query,
                 medium=lambda num, pose: medium_for(modes[0], num, pose), render=render, score=score, loc=loc, loc_public=loc_pub,
                 out_dir=args.out_dir, ref_poses=ref_poses, ref_fit=ref_fit, ref_source=ref_src[2], coarse_iters=args.gscpe_passes,
                 levels=args.gscpe_levels, steps=args.gscpe_steps, lr=args.gscpe_lr, views=args.gscpe_views,
                 ablation=not args.gscpe_no_ablation, depth_m=args.gscpe_depth_m, fast=not args.gscpe_no_fast, fast_topk=args.fast_topk,
-                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr), fast_cell=args.fast_cell, fast_dim=args.fast_dim, water=water_parts if water_ok else None))
-            gtext = bench_gscpe.report(gres, dict(
+                fast_photo=args.fast_photo, fast_check=dict(min_corr=args.fast_min_corr), fast_cell=args.fast_cell, fast_dim=args.fast_dim, water=water_parts if water_ok else None)
+            gres = bench_gscpe.run(gctx)
+            ginfo = dict(
                 scene=args.scene_dir, map_frames=n, hw=[h, w], primitives=int(g["n_out"]) + n_far + n_win, map_mb=map_mb,
                 mapping_seconds=args.bench_mapping_seconds, model=args.lora, weights_mb=weights_mb, reference=ref_text,
-                mapping_frames=n + (held_info["queries"] if held_info else 0), map_seconds=t_map,
-                split="test : train = 1 : %.1f" % (n / max(len(tests), 1)))) + tail
-            open(os.path.join(args.out_dir, "gscpe.txt"), "w").write(gtext + "\n")
+                mapping_frames=n + (held_info["queries"] if held_info else 0), load_seconds=t_load, map_seconds=t_map - t_load, field_seconds=t_field,
+                split="test : train = 1 : %.1f" % (n / max(len(tests), 1)))
+            gtext = bench_gscpe.report(gres, ginfo) + tail
+            gpath = os.path.join(args.out_dir, "gscpe.txt")
+            open(gpath, "w").write(gtext + "\n")
             out["gscpe"] = gres
+            want_s = bench_strategies.options(args, map_images=imgs, ref_cache=ref_cache, ref_fit=ref_fit, law=lambda m_, z_: beta_at(phys, m_, z_),
+                                              query_info=bench_strategies.scene_queries(args.data_dir) if args.medium_adapt else None)
+            sshort = []
+            if want_s:
+                stexts, sshort, sres = bench_strategies.run(gctx, gres, want_s, args.out_dir, text=gtext, path=gpath)
+                if "verify" in sres:
+                    out["verify"] = {k: v for k, v in sres["verify"].items() if k != "candidates"}
+                gtext = "\n".join([gtext] + stexts)
             text = gtext if text is None else text + "\n" + gtext
-            gshort = "\n".join(["=" * bench_gscpe.W] + bench_gscpe.in_short(gres, dict(
-                map_frames=n, mapping_seconds=args.bench_mapping_seconds, map_seconds=t_map,
-                mapping_frames=n + (held_info["queries"] if held_info else 0))) + ["=" * bench_gscpe.W])
+            gshort = "\n".join(["=" * bench_gscpe.W] + bench_gscpe.in_short(gres, ginfo) + sshort + ["=" * bench_gscpe.W])
+            open(os.path.join(args.out_dir, "short.txt"), "w").write(gshort + "\n")
+            if want_s:
+                open(gpath, "w").write(gtext + "\n" + gshort + "\n")
     elif args.bench and args.data_dir:
         import bench_loc
         tests = sorted(json.load(open(args.split_json or os.path.join(args.data_dir, "split.json")))["test_files"], key=E.fnum)

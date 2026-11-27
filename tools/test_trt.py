@@ -141,6 +141,7 @@ def check_bench():
                               weights_mb={"none": 0.0}, reference="truth", split="1 : 3"))
     labels = [r["label"] for r in res["rows"]]
     assert "fast: TensorRT encoder" in labels and "fast + check, TensorRT encoder" in labels, labels
+    assert "no render: TensorRT encoder" in labels and "no render, branch only, TensorRT encoder" in labels, labels
     assert "TensorRT encoder: FP16 engine" in text and "fast: TensorRT encoder" in text[:text.index(" Reference")] and loc.use_trt is False
     row = next(r for r in res["rows"] if r["label"] == "fast + check, TensorRT encoder")
     assert row["px"] < 0.6, row

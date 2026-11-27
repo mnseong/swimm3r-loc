@@ -573,7 +573,7 @@ def report(res, info):
         L += ["-" * W, " Reference   poses of an offline mapping of all frames (the map frames and the queries together), no external reconstruction,",
               "             moved into this map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ" % (
                   f.get("n", 0), f.get("scale", float("nan"))),
-              "             by a median of %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), the floor of every pose error below. %d of %d queries have one." % (
+              "             by a median of %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), which does not bound the error of a query pose. %d of %d queries have one." % (
                   f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")), r["verified"], r["frames"])]
     else:
         L += ["-" * W, " Reference   every held-out frame registered to the map offline with no time limit, no external reconstruction",

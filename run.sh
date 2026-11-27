@@ -14,11 +14,17 @@ PHYS="${PHYS:-$W/0019_physics.pth}"
 H="${HEAD:-$H0}"
 TAG0="${TAG:-}"
 TAG="${TAG:+_$TAG}"
+SCENE="${SCENE:-data/video1}"
+SCENE="${SCENE%/}"
 LOC=(--anchor_px 6 --min_conf_thr 0.5 --fps 5 --medium_raster s2 --binf_veil)
 case "$M" in
   v13c) ;;
-  *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses] run.sh [v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; exit 1 ;;
+  *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses SCENE=folder FIXED_SPLIT=1] run.sh [v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; echo "SCENE=data/sealoc_s1 (default data/video1) takes the images and splits of another scene folder, its name is added to the output folders. FIXED_SPLIT=1 maps the train_files.txt of the scene and localizes the test_files of its split.json, the reference REF of all frames is moved into the map through a similarity on the map frames (HOLD_MAP=moved)"; exit 1 ;;
 esac
+if [ "$(cd "$SCENE" 2>/dev/null && pwd -P)" != "$(cd "$D/data/video1" 2>/dev/null && pwd -P)" ]; then
+  [ -d "$SCENE/images" ] || { echo "no images at $SCENE/images (SCENE=$SCENE)"; exit 1; }
+  TAG="_$(basename "$SCENE")$TAG"
+fi
 export PYTHONPATH="$D/ubs/submodules:${PYTHONPATH:-}"
 mkdir -p "$D/.cache/torch" "$D/.cache/tmp" "$D/.cache/mpl"
 export TORCH_HOME="$D/.cache/torch" TMPDIR="$D/.cache/tmp" MPLCONFIGDIR="$D/.cache/mpl"
@@ -48,7 +54,7 @@ if [ "$HOLD" != 0 ]; then
   [ "$HM" = register ] && [ "${REF_MATCHER:-ours}" = loftr ] && RS="_loftr"
   case "$HM" in register) O="$OUT/${M}${TAG}_hold${HB}w${WIN}${RS}" ;; moved) O="$OUT/${M}${TAG}_hold${HB}w${WIN}_moved" ;; same) SD="$OUT/split_${M}${TAG}_hold${HB}"; O="$OUT/${M}${TAG}_hold${HB}_same" ;; esac
   mkdir -p "$SD" "$O"
-  ls data/video1/images | grep -E '\.(jpg|jpeg|png)$' | sort > "$SD/all.txt"
+  ls "$SCENE/images" | grep -E '\.(jpg|jpeg|png)$' | sort > "$SD/all.txt"
   awk -v s="$HOLD" -v b="$BLOCK" '{a[NR]=$0} END{c=int((s-b)/2); for(i=1;i<=NR;i++){r=(i-1)%s; h=(b==1)?(i%s==0):(r>=c && r<c+b); if (i==1 || i==NR || (b>1 && i-r+s-1>NR)) h=0; if (!h) print a[i]}}' "$SD/all.txt" > "$SD/frames.txt"
   python -c "import json,sys; d=sys.argv[1]; a=[l.strip() for l in open(d+'/all.txt') if l.strip()]; m=set(l.strip() for l in open(d+'/frames.txt')); json.dump({'test_files':[x for x in a if x not in m],'centre_files':[]}, open(d+'/split.json','w'))" "$SD"
   NQ=$(( $(wc -l < "$SD/all.txt") - $(wc -l < "$SD/frames.txt") ))
@@ -57,7 +63,7 @@ if [ "$HOLD" != 0 ]; then
     echo "map frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($SPLIT), $NQ queries; one Stage 1 reconstruction of all frames gives every pose, the queries are left out of the Gaussian map, the medium field and the retrieval store, and their poses there are the reference (the queries do take part in that reconstruction)"
     if [ ! -f "$OUT/map_${M}${TAG}_all/scene.pkl" ]; then
       echo "the Stage 1 reconstruction of all frames is missing: it is made first (EVERY=1)"
-      HOLD=0 REF= TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
+      HOLD=0 REF= SCENE="$SCENE" TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
     fi
     [ -f "$OUT/map_${M}${TAG}_all/scene.pkl" ] || { echo "no reconstruction of all frames at $OUT/map_${M}${TAG}_all, stopped"; exit 1; }
     MP="$OUT/map_${M}${TAG}_all"
@@ -83,16 +89,28 @@ if [ "$HOLD" != 0 ]; then
     else
       if [ ! -f "$OUT/map_${M}${TAG}_all/scene.pkl" ]; then
         echo "the mapping of all frames, the reference of the queries, is missing: it is made first (EVERY=1)"
-        HOLD=0 REF= TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
+        HOLD=0 REF= SCENE="$SCENE" TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
       fi
       [ -f "$OUT/map_${M}${TAG}_all/scene.pkl" ] || { echo "no reference mapping at $OUT/map_${M}${TAG}_all, stopped"; exit 1; }
       EXTRA+=(--proto_ref_scene "$OUT/map_${M}${TAG}_all" --proto_ref_frames 2)
     fi
   fi
+elif [ "${FIXED_SPLIT:-0}" = 1 ]; then
+  [ -f "$SCENE/train_files.txt" ] && [ -f "$SCENE/split.json" ] || { echo "FIXED_SPLIT=1 needs $SCENE/train_files.txt and $SCENE/split.json"; exit 1; }
+  [ "${HOLD_MAP:-moved}" = moved ] || { echo "FIXED_SPLIT=1 takes HOLD_MAP=moved only, registration by frame number does not hold across visits"; exit 1; }
+  [ -n "$REF" ] && [ -e "$REF" ] || { echo "FIXED_SPLIT=1 needs REF, the reference poses of the map frames and the queries (REF=${REF:-unset})"; exit 1; }
+  MP="$OUT/map_${M}${TAG}_fixed"
+  O="$OUT/${M}${TAG}_fixed_moved"
+  mkdir -p "$MP" "$O"
+  cp "$SCENE/train_files.txt" "$MP/frames.txt"
+  cp "$SCENE/split.json" "$MP/split.json"
+  echo "mapping frames $(wc -l < "$MP/frames.txt") (train_files.txt of $SCENE), queries are the test_files of $SCENE/split.json, pair window $WIN, the reference $REF is moved into the map by a similarity fitted on the map frames"
+  EXTRA=(--split_json "$MP/split.json" --proto_ref_poses "$REF" --proto_ref_frames 2)
+  if [ "${TRT:-0}" = 1 ]; then EXTRA+=(--trt_encoder); fi
 elif [ "$EVERY" != 0 ]; then
   if [ "$EVERY" = 1 ]; then MP="$OUT/map_${M}${TAG}_all"; O="$OUT/${M}${TAG}_all"; else MP="$OUT/map_${M}${TAG}_every${EVERY}w${WIN}"; O="$OUT/${M}${TAG}_every${EVERY}w${WIN}"; fi
   mkdir -p "$MP" "$O"
-  ls data/video1/images | grep -E '\.(jpg|jpeg|png)$' | sort > "$MP/all.txt"
+  ls "$SCENE/images" | grep -E '\.(jpg|jpeg|png)$' | sort > "$MP/all.txt"
   awk -v s="$EVERY" '{a[NR]=$0} END{for(i=1;i<=NR;i+=s) print a[i]; if ((NR-1)%s!=0) print a[NR]}' "$MP/all.txt" > "$MP/frames.txt"
   python -c "import json,sys; d=sys.argv[1]; a=[l.strip() for l in open(d+'/all.txt') if l.strip()]; m=set(l.strip() for l in open(d+'/frames.txt')); json.dump({'test_files':[x for x in a if x not in m],'centre_files':[]}, open(d+'/split.json','w'))" "$MP"
   echo "mapping frames: $(wc -l < "$MP/frames.txt") of $(wc -l < "$MP/all.txt") (every ${EVERY} of all frames), the other $(( $(wc -l < "$MP/all.txt") - $(wc -l < "$MP/frames.txt") )) are queries, pair window $WIN"
@@ -100,7 +118,7 @@ elif [ "$EVERY" != 0 ]; then
   if [ "$EVERY" != 1 ]; then
     if [ ! -f "$OUT/map_${M}${TAG}_all/scene.pkl" ]; then
       echo "the mapping of all frames, the reference of the sparse maps, is missing: it is made first (EVERY=1)"
-      TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
+      SCENE="$SCENE" TAG="$TAG0" WIN=5 EVERY=1 bash "$D/run.sh" "$M" "$OUT"
     fi
     [ -f "$OUT/map_${M}${TAG}_all/scene.pkl" ] || { echo "no reference mapping at $OUT/map_${M}${TAG}_all, stopped"; exit 1; }
     EXTRA+=(--proto_ref_scene "$OUT/map_${M}${TAG}_all" --proto_ref_frames 2)
@@ -108,18 +126,18 @@ elif [ "$EVERY" != 0 ]; then
 else
   if [ "$STRIDE" = 1 ] && [ "$WIN" = 5 ]; then MP="$OUT/map_${M}${TAG}"; O="$OUT/$M$TAG"; else MP="$OUT/map_${M}${TAG}_s${STRIDE}w${WIN}"; O="$OUT/${M}${TAG}_s${STRIDE}w${WIN}"; fi
   mkdir -p "$MP" "$O"
-  awk -v s="$STRIDE" '{a[NR]=$0} END{for(i=1;i<=NR;i+=s) print a[i]; if ((NR-1)%s!=0) print a[NR]}' data/video1/train_files.txt > "$MP/frames.txt"
-  echo "mapping frames: $(wc -l < "$MP/frames.txt") of $(wc -l < data/video1/train_files.txt) (every ${STRIDE}), pair window $WIN"
+  awk -v s="$STRIDE" '{a[NR]=$0} END{for(i=1;i<=NR;i+=s) print a[i]; if ((NR-1)%s!=0) print a[NR]}' "$SCENE/train_files.txt" > "$MP/frames.txt"
+  echo "mapping frames: $(wc -l < "$MP/frames.txt") of $(wc -l < "$SCENE/train_files.txt") (every ${STRIDE}), pair window $WIN"
 fi
 for f in "$LORA" "$PHYS" "$H" "$(dirname "$(dirname "$LORA")")/train_encoder_args.json"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
 if [ ! -f "$MP/mapping_seconds" ]; then
   echo "mapping: Stage 1 of the map frames with the backbone $LORA, no descatter (the Gaussian head reads the observed colour and the water of the physics head)"
   T0=$(date +%s)
-  python swimm3r_colmap.py --imagedir data/video1/images --outdir "$MP" --finetuned_model "$LORA" --physics_model "" \
+  python swimm3r_colmap.py --imagedir "$SCENE/images" --outdir "$MP" --finetuned_model "$LORA" --physics_model "" \
     --train_test_split none --subset_list "$MP/frames.txt" --winsize "$WIN"
   echo $(( $(date +%s) - T0 )) > "$MP/mapping_seconds"
 fi
 if [ "$EVERY" = 1 ]; then echo "mapping of all frames done in $(cat "$MP/mapping_seconds") s, the reference of the EVERY=N runs: $MP"; exit 0; fi
-python tools/stage1_splatt3r.py --scene_dir "$MP" --data_dir data/video1 --lora "$LORA" --physics "$PHYS" \
+python tools/stage1_splatt3r.py --scene_dir "$MP" --data_dir "$SCENE" --lora "$LORA" --physics "$PHYS" \
   --head "$H" "${LOC[@]}" --medium field --out_dir "$O/loc" --bench \
   --bench_mapping_seconds "$(cat "$MP/mapping_seconds")" ${EXTRA[@]+"${EXTRA[@]}"} "${@:3}"

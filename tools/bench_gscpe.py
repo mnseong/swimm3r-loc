@@ -109,6 +109,8 @@ def run(ctx):
         fl, sc = [], []
         for j in range(len(tests)):
             num = E.fnum(tests[j])
+            if not min(map_nums) <= num <= max(map_nums):
+                num = map_nums[ref[j]["near"]]
             pt = tens(ref[j]["pose"])
             with torch.no_grad():
                 img, alpha = ctx["render"](pt, ctx["medium"](num, pt), t=num / fps, alpha=True)
@@ -174,7 +176,7 @@ def run(ctx):
         if a is None:
             return
         a.update(label=label, family=family)
-        res["per_query"][label] = [dict(r["ev"], ok=bool(r.get("ok", True)), sec=r.get("sec")) for r in rows]
+        res["per_query"][label] = [dict(r["ev"], ok=bool(r.get("ok", True)), sec=r.get("sec"), pose=r.get("pose")) for r in rows]
         p = B.power_summary(tegra.window(*window)) if window else None
         if p and "s_mean" in a:
             a.update(power_w=p["total_w"], joule=p["total_w"] * a["s_mean"])
@@ -197,11 +199,11 @@ def run(ctx):
 
     def rows_of(runs, key):
         if key == "start":
-            return [dict(ok=True, sec=x["retrieval"], ev=evaluate(j, x["start"], x["num"])) for j, x in enumerate(runs)]
+            return [dict(ok=True, sec=x["retrieval"], pose=x["start"], ev=evaluate(j, x["start"], x["num"])) for j, x in enumerate(runs)]
         if key == "coarse":
-            return [dict(ok=x["coarse"]["ok"], sec=x["retrieval"] + x["coarse"]["seconds"], ev=evaluate(j, x["coarse"]["pose"], x["num"])) for j, x in enumerate(runs)]
+            return [dict(ok=x["coarse"]["ok"], sec=x["retrieval"] + x["coarse"]["seconds"], pose=x["coarse"]["pose"], ev=evaluate(j, x["coarse"]["pose"], x["num"])) for j, x in enumerate(runs)]
         return [dict(ok=x["coarse"]["ok"] and x["refine"]["valid"], sec=x["retrieval"] + x["coarse"]["seconds"] + x["refine"]["seconds"],
-                     ev=evaluate(j, x["refine"]["pose"], x["num"])) for j, x in enumerate(runs)]
+                     pose=x["refine"]["pose"], ev=evaluate(j, x["refine"]["pose"], x["num"])) for j, x in enumerate(runs)]
 
     if tests:
         j0 = 0
@@ -252,7 +254,7 @@ def run(ctx):
                 for j, x in enumerate(runs):
                     r = warp(j, x["coarse"]["pose"], x["num"], "underwater", **over)
                     rows.append(dict(ok=x["coarse"]["ok"] and r["valid"], sec=x["retrieval"] + x["coarse"]["seconds"] + r["seconds"],
-                                     ev=evaluate(j, r["pose"], x["num"])))
+                                     pose=r["pose"], ev=evaluate(j, r["pose"], x["num"])))
                 add(label, "ablation", rows)
             except Exception as e:
                 res["notes"].append("%s failed: %s: %s" % (label, type(e).__name__, e))
@@ -362,6 +364,8 @@ def run(ctx):
             timed("fast: TensorRT encoder", "trt", with_trt(lambda im: LF.localize_fast(loc, im, at("underwater"), **fk)), "trt_fast")
             timed("fast + check, TensorRT encoder", "trt",
                   with_trt(lambda im: LF.localize_tiered(loc, im, at("underwater"), check=chk, half=half, **fk)), "trt_tiered")
+            timed("no render: TensorRT encoder", "trt", with_trt(lambda im: loc.localize(im, topk=1)), "trt_norender")
+            timed("no render, branch only, TensorRT encoder", "trt", with_trt(lambda im: loc.localize(im, topk=1, lean=True)), "trt_lean")
         if ctx.get("loc_public") is not None:
             timed("public MASt3R: tokens, PnP, alignment", "public", lambda im: LF.localize_fast(ctx["loc_public"], im, at("underwater"), **fk))
         if anchors is not None:
@@ -439,22 +443,41 @@ def table(rows, key_t, key_acc, unit):
     return out
 
 
-KEY_ROWS = ("no render: match the map frame, PnP", "coarse: render, match, PnP", "refine: + masked warping", "fast: tokens, PnP, direct alignment",
+KEY_ROWS = ("no render: match the map frame, PnP", "no render, descriptor branch only", "no render, branch only, half prec.", "coarse: render, match, PnP",
+            "refine: + masked warping", "fast: tokens, PnP, direct alignment",
             "fast + check (decoder when it fails)", "fast + check, half precision", "anchors: map tokens in 3D, alignment",
             "anchors + check (decoder if it fails)", "anchors + check, half precision", "anchors: water aligned", "anchors + check: water aligned",
-            "anchors + check, water, half prec.", "fast: TensorRT encoder", "fast + check, TensorRT encoder")
+            "anchors + check, water, half prec.", "fast: TensorRT encoder", "fast + check, TensorRT encoder",
+            "no render: TensorRT encoder", "no render, branch only, TensorRT encoder")
+
+
+def mapping_parts(info):
+    ms = info.get("mapping_seconds")
+    if not ms:
+        return None, None
+    parts = [("Stage 1", ms)]
+    if info.get("load_seconds") is not None:
+        parts.append(("reading the Stage 1 output and loading the networks", info["load_seconds"]))
+    gm = info.get("map_seconds")
+    parts.append(("Gaussian map", gm) if "field_seconds" in info else ("Gaussian map and medium field", gm))
+    if "field_seconds" in info:
+        parts.append(("medium field fit", info["field_seconds"]))
+    tot = sum(float(v) for _, v in parts if v is not None)
+    say = lambda k, v: "%s %.0f s" % (k, float(v)) if v is not None else ("no medium field fitted" if k == "medium field fit" else "%s not timed" % k)
+    return tot, ", ".join(say(k, v) for k, v in parts)
 
 
 def in_short(res, info):
     L = []
     mf = int(info.get("mapping_frames") or info["map_frames"])
-    ms, gm = info.get("mapping_seconds"), info.get("map_seconds")
-    if ms:
-        tot = float(ms) + float(gm or 0.0)
-        L.append(" In short    mapping, run once: %d frames in %.0f s, %.1f s per frame (Stage 1 %.0f s, Gaussian map and medium field %s)" % (
-            mf, tot, tot / mf, float(ms), "%.0f s" % gm if gm is not None else "not timed"))
+    tot, how = mapping_parts(info)
+    if tot is not None:
+        L.append(" In short    mapping, run once: %d frames in %.0f s, %.1f s per frame" % (mf, tot, tot / mf))
+        L.append("             %s" % how)
     L.append(" %s localization of one query: seconds (FPS) | queries within 2 %% and 2 deg, within 5 %% and 5 deg | median error %% of depth, deg"
-             " | flow px (no reference)" % ("           " if ms else "In short   "))
+             " | flow px (no reference)" % ("           " if tot is not None else "In short   "))
+    nq, sk = int(res.get("frames") or 0), int(res.get("skipped") or 0)
+    L.append("             %d queries scored, %d of the %d queries of the split have no accepted reference and are left out" % (nq, sk, nq + sk))
     by = {r["label"]: r for r in res["rows"]}
     for lab in KEY_ROWS:
         r = by.get(lab)
@@ -478,11 +501,11 @@ def report(res, info):
     L.append(" map         %.2f M primitives, one feed forward pass, no training on the scene | %.1f MB as float32 tensors | tokens %.1f MB | points %.1f MB" % (
         info["primitives"] / 1e6, info["map_mb"], st["tokens"], st["points"]))
     L.append(" model       %s" % info["model"])
-    if info.get("mapping_seconds"):
+    tot, how = mapping_parts(info)
+    if tot is not None:
         mf = int(info.get("mapping_frames") or info["map_frames"])
-        L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization%s" % (
-            info["mapping_seconds"], mf, info["mapping_seconds"] / mf,
-            "; the poses of the queries come from this same reconstruction" if mf != info["map_frames"] else ""))
+        L.append(" mapping     %.0f s for %d frames (%.2f s per frame), run once before localization" % (tot, mf, tot / mf))
+        L.append("             %s%s" % (how, ". The poses of the queries come from this same reconstruction" if mf != info["map_frames"] else ""))
     L += ["-" * W] + in_short(res, info)
     L += ["-" * W] + R.reference_lines(res.get("fit"), info.get("reference"), res.get("skipped"))
     rc = res.get("reference_check") or {}

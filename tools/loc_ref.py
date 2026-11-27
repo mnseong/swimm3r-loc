@@ -36,7 +36,48 @@ def lift(loc, i, pq, pm):
     return np.ascontiguousarray(pq[ok], dtype=np.float64), loc.xyz[i][v, u][torch.as_tensor(ok, device=loc.xyz.device)].double().cpu().numpy()
 
 
-def register_queries(loc, tests, load, map_nums, interp, k=6, tol=2.0, min_inliers=50, min_ratio=0.3, verbose=True, matcher=None, images=None):
+def depth_lifter(loc, rgbd, min_alpha=0.5, common=False, store=None):
+    maps = {}
+    raw = {} if store is None else store
+
+    def get(i):
+        if i not in maps:
+            if i not in raw:
+                with torch.no_grad():
+                    _, al, dp = rgbd(i)[:3]
+                raw[i] = (dp.reshape(loc.h, loc.w).float(), al.reshape(loc.h, loc.w).float())
+            dp, al = raw[i]
+            ok = (al > min_alpha) & torch.isfinite(dp) & (dp > 1e-6)
+            if common:
+                ok = ok & loc.valid[i].to(ok.device)
+            maps[i] = (dp, ok)
+        return maps[i]
+
+    def run(lz, i, pq, pm):
+        if len(pm) == 0:
+            return np.zeros((0, 2)), np.zeros((0, 3))
+        dp, ok = get(int(i))
+        u = torch.as_tensor(np.clip(np.round(pm[:, 0]), 0, lz.w - 1).astype(np.int64), device=dp.device)
+        v = torch.as_tensor(np.clip(np.round(pm[:, 1]), 0, lz.h - 1).astype(np.int64), device=dp.device)
+        keep = ok[v, u]
+        z = dp[v, u][keep].double()
+        uu, vv = u[keep].double(), v[keep].double()
+        K = lz.K
+        c = torch.as_tensor(np.asarray(lz.poses[int(i)]), dtype=torch.float64, device=dp.device)
+        cam = torch.stack([(uu - float(K[0, 2])) / float(K[0, 0]) * z, (vv - float(K[1, 2])) / float(K[1, 1]) * z, z], -1)
+        return np.ascontiguousarray(pq[keep.cpu().numpy()], dtype=np.float64), (cam @ c[:3, :3].T + c[:3, 3]).cpu().numpy()
+
+    run.name = "the depth of the Gaussian map rendered at the map camera (restored render, opacity above %.1f%s)" % (
+        min_alpha, ", only where Stage 1 has a point too" if common else "")
+    run.maps = maps
+    return run
+
+
+def register_queries(loc, tests, load, map_nums, interp, k=6, tol=2.0, min_inliers=50, min_ratio=0.3, verbose=True, matcher=None, images=None,
+                     lifter=None, cache=None, tag="ref"):
+    if lifter is not None and matcher is None:
+        raise ValueError("lifting by another depth needs an outside matcher, the matcher of the map lifts by its own points")
+    up = lift if lifter is None else lifter
     nums = [E.fnum(x) for x in tests]
     map_nums = [int(x) for x in map_nums]
     hw = (loc.h, loc.w)
@@ -44,6 +85,7 @@ def register_queries(loc, tests, load, map_nums, interp, k=6, tol=2.0, min_inlie
     sub = loc.subsample
     loc.subsample = max(2, int(sub) // 2)
     poses, rows = {}, []
+    calls = [0, 0]
     try:
         for j, name in enumerate(tests):
             lo = sorted([i for i in range(loc.n) if map_nums[i] < nums[j]], key=lambda i: nums[j] - map_nums[i])[:k // 2]
@@ -58,8 +100,19 @@ def register_queries(loc, tests, load, map_nums, interp, k=6, tol=2.0, min_inlie
                 a2, a3 = loc.match(fq, lo)[:2]
                 b2, b3 = loc.match(fq, hi)[:2]
             else:
+                def pair(i, name=name, img=img):
+                    key = (name, int(i))
+                    if cache is not None and key in cache:
+                        calls[1] += 1
+                        return cache[key]
+                    calls[0] += 1
+                    got = matcher(img, images[i])
+                    if cache is not None:
+                        cache[key] = got
+                    return got
+
                 def side(ids):
-                    got = [lift(loc, i, *matcher(img, images[i])) for i in ids]
+                    got = [up(loc, i, *pair(i)) for i in ids]
                     return np.concatenate([g[0] for g in got]), np.concatenate([g[1] for g in got])
                 a2, a3 = side(lo)
                 b2, b3 = side(hi)
@@ -80,8 +133,8 @@ def register_queries(loc, tests, load, map_nums, interp, k=6, tol=2.0, min_inlie
                     poses[name] = np.asarray(s["c2w"], dtype=np.float64)
             rows.append(row)
             if verbose:
-                print("[ref] frame %06d: registered on the map frames %s with %d inliers of %d matches | earlier and later map frames alone differ by %s | %s" % (
-                    nums[j], row["frames"], row["inliers"], row["matches"],
+                print("[%s] frame %06d: registered on the map frames %s with %d inliers of %d matches | earlier and later map frames alone differ by %s | %s" % (
+                    tag, nums[j], row["frames"], row["inliers"], row["matches"],
                     "%.2f px (%.2f %% of depth, %.2f deg)" % (row["half_px"], row["half_t"], row["half_r"]) if row["half_px"] is not None else "no pose",
                     "verified" if row["verified"] else "not verified"), flush=True)
     finally:
@@ -92,6 +145,10 @@ def register_queries(loc, tests, load, map_nums, interp, k=6, tol=2.0, min_inlie
                half_t_med=col("half_t", 50), half_r_med=col("half_r", 50), inliers_med=float(np.median([r["inliers"] for r in rows])) if rows else None,
                matches_med=float(np.median([r["matches"] for r in rows])) if rows else None, grid=int(max(2, int(sub) // 2)),
                matcher=getattr(matcher, "name", "matcher") if matcher is not None else None)
+    if lifter is not None:
+        fit["lift"] = getattr(lifter, "name", "another depth")
+    if cache is not None:
+        fit.update(matcher_calls=calls[0], reused=calls[1])
     return poses, fit, rows
 
 
@@ -100,7 +157,11 @@ def reference_lines(fit, text=None, skipped=0):
     gone = " %d queries without a reference are left out." % skipped if skipped else ""
     if f.get("register"):
         num = lambda key, spec: "-" if f.get(key) is None else spec % f[key]
-        if f.get("matcher"):
+        if f.get("matcher") and f.get("lift"):
+            how = ["             changed. The query is matched to the %d map frames nearest in time with %s," % (f.get("k", 0), f["matcher"]),
+                   "             a matcher none of the methods below uses. The matches are lifted by %s," % f["lift"],
+                   "             PnP with RANSAC and a refit on"]
+        elif f.get("matcher"):
             how = ["             changed: the query is matched to the %d map frames nearest in time with %s," % (f.get("k", 0), f["matcher"]),
                    "             a matcher none of the methods below uses; the matches are lifted by the points of the map, PnP with RANSAC and a refit on"]
         else:
@@ -113,7 +174,7 @@ def reference_lines(fit, text=None, skipped=0):
                 + how
                 + ["             registrations on the earlier and on the later map frames alone agree within %.1f px: %d of %d queries.%s" % (
                        f.get("tol", float("nan")), f.get("n", 0), f.get("total", 0), gone),
-                   "             The two differ by a median of %s px (p90 %s), %s %% of depth and %s deg: the floor of every pose error below." % (
+                   "             The two differ by a median of %s px (p90 %s), %s %% of depth and %s deg, which does not bound an error both share." % (
                        num("half_px_med", "%.2f"), num("half_px_p90", "%.2f"), num("half_t_med", "%.2f"), num("half_r_med", "%.2f"))])
     out = [" Reference   %s" % (text or "poses of a reconstruction of all frames, the queries included")]
     if f.get("same"):
@@ -122,6 +183,6 @@ def reference_lines(fit, text=None, skipped=0):
     else:
         out += ["             moved into the map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ by a median of" % (
                     f.get("n", 0), f.get("scale", float("nan"))),
-                "             %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), the floor of every pose error below.%s" % (
+                "             %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), which does not bound the error of a query pose.%s" % (
                     f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")), gone)]
     return out
