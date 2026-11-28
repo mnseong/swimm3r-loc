@@ -6,13 +6,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_gscpe import KEY_ROWS
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
+MODE = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CMP_MODE", "loftr")
 MODELS = [("v18e10", "ours, v18 epoch 10"), ("splatt3r", "Splatt3R (public)")]
 VIDEOS = ["video1", "video2", "video3", "video4"]
 
 
 def scores(m, v):
     tag = "" if v == "video1" else "_" + v
-    p = os.path.join(OUT, "%s%s_hold12b3w5_loftr" % (m, tag), "loc", "scores.json")
+    p = os.path.join(OUT, "%s%s_hold12b3w5_%s" % (m, tag, MODE), "loc", "scores.json")
     try:
         return json.load(open(p)).get("gscpe")
     except Exception:
@@ -29,13 +30,31 @@ def f(x, spec):
 
 
 res = {(m, v): scores(m, v) for m, _ in MODELS for v in VIDEOS}
-W = 118
-L = ["=" * W, " Splatt3R against ours with the same localization code, Barbados videos 1 to 4, GS-CPE split (3 of every 12 frames are queries, never mapped),",
-     " reference: LoFTR registration of every query into the map of that model, errors in percent of the median map depth", "-" * W]
+W = 132
+if MODE == "moved":
+    ref = (" reference: one reconstruction of all frames per video (COLMAP SIFT, video2 GLUEMAP, data/videoN/ref_meta.json), moved into each map by a similarity on its map frames,",
+           " errors in percent of the reference depth moved into each map (one denominator for both models)")
+else:
+    ref = (" reference: LoFTR registration of every query into the map of that model, errors in percent of the median map depth",
+           " (the reference and the scored queries differ between the models)")
+L = ["=" * W, " Splatt3R against ours with the same localization code, Barbados videos 1 to 4, GS-CPE split (3 of every 12 frames are queries, never mapped),"] + list(ref) + ["-" * W]
 L.append(" queries scored   " + " | ".join("%-18s %s" % (lab, " ".join(f((res[(m, v)] or {}).get("frames"), "%3d") for v in VIDEOS)) for m, lab in MODELS))
-L.append(" per scene: FPS (1 / mean seconds per query), then queries within 5 % and 5 deg | mean of the four scenes: FPS, within 5/5, within 2/2, median %, deg")
-L.append(" %-38s %-20s %s | %s | %6s %6s %6s %6s %6s" % ("method", "model", " ".join("%5s" % v.replace("video", "v") for v in VIDEOS),
-                                                      " ".join("%5s" % v.replace("video", "v") for v in VIDEOS), "FPS", "5/5", "2/2", "t %", "deg"))
+L.append(" queries held out " + " | ".join("%-18s %s" % (lab, " ".join(f(((res[(m, v)] or {}).get("frames") or 0) + ((res[(m, v)] or {}).get("skipped") or 0) if res[(m, v)] else None, "%3d") for v in VIDEOS)) for m, lab in MODELS))
+same = []
+for v in VIDEOS:
+    ns = [tuple((res[(m, v)] or {}).get("names") or ()) for m, _ in MODELS]
+    same.append("%s %s" % (v.replace("video", "v"), "-" if not all(ns) else ("same" if len(set(ns)) == 1 else "DIFFERENT")))
+L.append(" query lists of the two models: " + ", ".join(same))
+for m, lab in MODELS:
+    hs = []
+    for v in VIDEOS:
+        h = ((res[(m, v)] or {}).get("fit") or {}).get("holdout")
+        hs.append("%s %s" % (v.replace("video", "v"), "-" if not h else "%.2f %% / %.2f deg" % (h["t_med"], h["r_med"])))
+    if any(not x.endswith("-") for x in hs):
+        L.append(" reference check, held out map frames, median (%s): %s" % (lab, ", ".join(hs)))
+L.append(" per scene: FPS (1 / mean seconds per query), then queries within 5 % and 5 deg | mean of the four scenes: FPS, within 10/5, 5/5, 2/2, 1/1, median %, deg")
+L.append(" %-38s %-20s %s | %s | %6s %6s %6s %6s %6s %6s %6s" % ("method", "model", " ".join("%5s" % v.replace("video", "v") for v in VIDEOS),
+                                                      " ".join("%5s" % v.replace("video", "v") for v in VIDEOS), "FPS", "10/5", "5/5", "2/2", "1/1", "t %", "deg"))
 for lab in KEY_ROWS:
     block = []
     for m, name in MODELS:
@@ -43,15 +62,18 @@ for lab in KEY_ROWS:
         if not any(r is not None and r.get("acc") is not None for r in rows):
             continue
         fps = [r.get("fps") if r else None for r in rows]
+        a10 = [r["acc"][0] if r and r.get("acc") else None for r in rows]
         a5 = [r["acc"][1] if r and r.get("acc") else None for r in rows]
         a2 = [r["acc"][2] if r and r.get("acc") else None for r in rows]
+        a1 = [r["acc"][3] if r and r.get("acc") else None for r in rows]
         t = [r.get("t") if r else None for r in rows]
         rr = [r.get("r") if r else None for r in rows]
-        block.append(" %-38s %-20s %s | %s | %6s %6s %6s %6s %6s" % (lab if not block else "", name, " ".join(f(x, "%5.2f") for x in fps),
-                     " ".join(f(x, "%5.1f") for x in a5), f(mean(fps), "%6.2f"), f(mean(a5), "%6.1f"), f(mean(a2), "%6.1f"), f(mean(t), "%6.2f"), f(mean(rr), "%6.2f")))
+        block.append(" %-38s %-20s %s | %s | %6s %6s %6s %6s %6s %6s %6s" % (lab if not block else "", name, " ".join(f(x, "%5.2f") for x in fps),
+                     " ".join(f(x, "%5.1f") for x in a5), f(mean(fps), "%6.2f"), f(mean(a10), "%6.1f"), f(mean(a5), "%6.1f"), f(mean(a2), "%6.1f"),
+                     f(mean(a1), "%6.1f"), f(mean(t), "%6.2f"), f(mean(rr), "%6.2f")))
     if block:
         L.extend(block)
 L.append("=" * W)
 text = "\n".join(L)
-open(os.path.join(OUT, "splatt3r_vs_ours.txt"), "w").write(text + "\n")
+open(os.path.join(OUT, "splatt3r_vs_ours%s.txt" % ("" if MODE == "loftr" else "_" + MODE)), "w").write(text + "\n")
 print(text)

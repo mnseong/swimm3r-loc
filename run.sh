@@ -90,9 +90,12 @@ if [ "$HOLD" != 0 ]; then
     MP="$SD"
     echo "mapping frames: $(wc -l < "$SD/frames.txt") of $(wc -l < "$SD/all.txt") ($SPLIT), $NQ queries, pair window $WIN; the reference is moved in from another reconstruction of all frames"
     EXTRA=(--split_json "$SD/split.json")
+    [ "${TRT:-0}" = 1 ] && EXTRA+=(--trt_encoder)
     if [ -n "$REF" ]; then
       [ -e "$REF" ] || { echo "no reference reconstruction at $REF, stopped"; exit 1; }
       EXTRA+=(--proto_ref_poses "$REF" --proto_ref_frames 2)
+      RDEP="${REF_DEPTH:-${REF%.json}_meta.json}"
+      if [ -f "$RDEP" ]; then EXTRA+=(--proto_ref_depth "$RDEP"); echo "reference depth for the percentages: $RDEP"; fi
     else
       if [ ! -f "$OUT/map_${M}${TAG}_all/scene.pkl" ]; then
         echo "the mapping of all frames, the reference of the queries, is missing: it is made first (EVERY=1)"

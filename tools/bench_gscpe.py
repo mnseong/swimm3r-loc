@@ -50,7 +50,11 @@ def run(ctx):
     hw = (loc.h, loc.w)
     warm = int(ctx.get("warmup", 2))
     map_nums = [int(x) for x in ctx["map_nums"]]
-    scale = float(np.median(loc.depths))
+    rf = ctx.get("ref_fit") or {}
+    scale = float(rf["depth_common"]) if rf.get("depth_common") else float(np.median(loc.depths))
+    print("[gscpe] queries: %d held out, %d with a reference pose, %d left out for lack of one | translation in percent of %s %.4f map units" % (
+        len(ctx["tests"]), len(tests), len(ctx["tests"]) - len(tests),
+        "the reference depth moved into this map (one denominator for every method)" if rf.get("depth_common") else "the median depth of this map", scale), flush=True)
     depth_m = ctx.get("depth_m")
     n_c = int(ctx.get("coarse_iters", 3))
     eps_t, eps_r = float(ctx.get("eps_t", 0.0002)), float(ctx.get("eps_r", 0.02))

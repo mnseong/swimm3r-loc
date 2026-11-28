@@ -325,6 +325,10 @@ def parser():
     ap.add_argument("--proto_ref_poses", default=None,
                     help="--proto and --gscpe: reference poses of all frames from another reconstruction, a COLMAP model (folder, images.bin "
                          "or images.txt) or a json of name to camera to world 4 x 4, moved into this map like --proto_ref_scene")
+    ap.add_argument("--proto_ref_depth", default=None,
+                    help="--proto_ref_poses: json with depth_median, the median depth of the frames in the units of the reference; translation "
+                         "errors are then given in percent of that depth moved into this map by the fitted scale, one denominator for every "
+                         "method, instead of the median depth of this map")
     ap.add_argument("--device", default="cuda")
     return ap
 
@@ -1139,6 +1143,26 @@ def main():
                 ref_text = ref_src[3]
                 print("[proto] reference from %s: %d of %d queries, fitted on %d map frames, scale %.3f, map frames differ by a median of %.2f %% of depth "
                       "and %.2f deg" % (ref_src[2], len(ref_poses), len(tests), fit["n"], fit["scale"], ref_fit["t_med"], ref_fit["r_med"]), flush=True)
+                if args.proto_ref_depth and args.proto_ref_poses:
+                    rmeta = json.load(open(args.proto_ref_depth))
+                    dref = float(rmeta["depth_median"])
+                    ref_fit.update(depth_ref=dref, depth_common=float(fit["scale"]) * dref, depth_map=float(np.median(loc.depths)))
+                    tp = 100.0 * np.asarray(fit["et"]) / ref_fit["depth_common"]
+                    ref_fit.update(t_med=float(np.median(tp)), t_max=float(tp.max()))
+                    print("[proto] one denominator for every method: the median depth of the reference frames %.4f moved into this map by the scale gives "
+                          "%.4f map units (the median depth of this map is %.4f); the map frames then differ by a median of %.2f %%, at most %.2f %%" % (
+                              dref, ref_fit["depth_common"], ref_fit["depth_map"], ref_fit["t_med"], ref_fit["t_max"]), flush=True)
+                hv = loc_geom.validate_transfer(ref_src[0], ref_src[1], list(names), poses_np, blocks=4)
+                if hv is not None:
+                    den = ref_fit.get("depth_common") or float(np.median(loc.depths))
+                    ht, hr = 100.0 * np.asarray(hv["et"]) / den, np.asarray(hv["er"])
+                    ref_fit["holdout"] = dict(blocks=hv["blocks"], t_med=float(np.median(ht)), t_p95=float(np.percentile(ht, 95)), t_max=float(ht.max()),
+                                              r_med=float(np.median(hr)), r_p95=float(np.percentile(hr, 95)), r_max=float(hr.max()),
+                                              scale_spread=float(100.0 * (max(hv["scales"]) - min(hv["scales"])) / np.mean(hv["scales"])))
+                    h = ref_fit["holdout"]
+                    print("[proto] reference check on held out map frames (the similarity fitted on 3 of 4 time blocks, tested on the fourth): %.2f %% median, "
+                          "%.2f %% p95, %.2f %% max of depth, %.2f / %.2f / %.2f deg, scale spread %.2f %% over the blocks; accuracy thresholds below this "
+                          "are not resolved by the reference" % (h["t_med"], h["t_p95"], h["t_max"], h["r_med"], h["r_p95"], h["r_max"], h["scale_spread"]), flush=True)
         loc_pub = None
         if args.proto_public:
             from mast3r.model import AsymmetricMASt3R

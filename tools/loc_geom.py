@@ -49,11 +49,20 @@ def inside(uv, hw):
     return (uv[:, 0] >= -0.5) & (uv[:, 0] <= hw[1] - 0.5) & (uv[:, 1] >= -0.5) & (uv[:, 1] <= hw[0] - 0.5)
 
 
+def ortho(R):
+    U, _, Vt = np.linalg.svd(np.asarray(R, dtype=np.float64))
+    return U @ np.diag([1.0, 1.0, float(np.sign(np.linalg.det(U @ Vt))) or 1.0]) @ Vt
+
+
+def angle(Ra, Rb):
+    c = 0.5 * (np.trace(ortho(Ra).T @ ortho(Rb)) - 1.0)
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+
 def pose_error(a, b, depth):
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     dt = float(np.linalg.norm(a[:3, 3] - b[:3, 3]))
-    c = 0.5 * (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0)
-    return 100.0 * dt / max(float(depth), 1e-9), float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+    return 100.0 * dt / max(float(depth), 1e-9), angle(a[:3, :3], b[:3, :3])
 
 
 def pixel_shift(K, ref, est, pts, hw):
@@ -127,15 +136,36 @@ def transfer_poses(ref_names, ref_poses, map_names, map_poses, want):
     s, R, t = fit
     moved = [move_pose(s, R, t, p) for p in A]
     et = [float(np.linalg.norm(m[:3, 3] - q[:3, 3])) for m, q in zip(moved, Bm)]
-    er = [float(np.degrees(np.arccos(np.clip(0.5 * (np.trace(m[:3, :3].T @ q[:3, :3]) - 1.0), -1.0, 1.0)))) for m, q in zip(moved, Bm)]
+    er = [angle(m[:3, :3], q[:3, :3]) for m, q in zip(moved, Bm)]
     out = {n: move_pose(s, R, t, np.asarray(ref_poses, dtype=np.float64)[ref_names.index(n)]) for n in want if n in ref_names}
     return out, dict(n=len(pairs), scale=float(s), idx=[i for i, _ in pairs], et=et, er=er)
 
 
+def validate_transfer(ref_names, ref_poses, map_names, map_poses, blocks=4):
+    ref_names = list(ref_names)
+    pairs = [(i, ref_names.index(n)) for i, n in enumerate(map_names) if n in ref_names]
+    if len(pairs) < 3 * blocks:
+        return None
+    A = np.asarray(ref_poses, dtype=np.float64)[[j for _, j in pairs]]
+    Bm = np.asarray(map_poses, dtype=np.float64)[[i for i, _ in pairs]]
+    et, er, scales = [], [], []
+    for test in np.array_split(np.arange(len(pairs)), int(blocks)):
+        train = np.setdiff1d(np.arange(len(pairs)), test)
+        fit = fit_poses(A[train], Bm[train])
+        if fit is None:
+            return None
+        s, R, t = fit
+        scales.append(float(s))
+        for k in test:
+            m = move_pose(s, R, t, A[k])
+            et.append(float(np.linalg.norm(m[:3, 3] - Bm[k][:3, 3])))
+            er.append(angle(m[:3, :3], Bm[k][:3, :3]))
+    return dict(blocks=int(blocks), idx=[i for i, _ in pairs], et=et, er=er, scales=scales)
+
+
 def motion(a, b):
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    c = 0.5 * (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0)
-    return float(np.linalg.norm(a[:3, 3] - b[:3, 3])), float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+    return float(np.linalg.norm(a[:3, 3] - b[:3, 3])), angle(a[:3, :3], b[:3, :3])
 
 
 def quat_rot(q):
