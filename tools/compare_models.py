@@ -32,7 +32,7 @@ def f(x, spec):
 res = {(m, v): scores(m, v) for m, _ in MODELS for v in VIDEOS}
 W = 132
 if MODE == "moved":
-    ref = (" reference: one reconstruction of all frames per video (COLMAP SIFT, video2 GLUEMAP, data/videoN/ref_meta.json), moved into each map by a similarity on its map frames,",
+    ref = (" reference: GLUEMAP reconstruction of all frames per video (the pseudo reference of the paper, data/videoN/ref_meta.json), moved into each map by a similarity on its map frames,",
            " errors in percent of the reference depth moved into each map (one denominator for both models)")
 else:
     ref = (" reference: LoFTR registration of every query into the map of that model, errors in percent of the median map depth",

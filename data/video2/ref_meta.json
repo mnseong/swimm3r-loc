@@ -156,5 +156,5 @@
  "points": 40677,
  "reproj_mean": 1.426529772585177,
  "camera": "1 SIMPLE_PINHOLE 1280 720 624.62355446380491 640 360",
- "source": "GLUEMAP reconstruction of all frames of the video (map frames and queries), /data/minseong/datasets/Barbados_gluemap_ref/video2/gluemap_aba on sia; COLMAP SIFT registered only 79 of 150 frames in one model, so this scene uses GLUEMAP, chosen by registration coverage before any method was evaluated"
+ "source": "GLUEMAP reconstruction of all frames of the video (map frames and queries), /data/minseong/datasets/Barbados_gluemap_ref/video2/gluemap_aba on sia, the pseudo reference of the paper; COLMAP with SIFT fails on these turbid scenes"
 }
