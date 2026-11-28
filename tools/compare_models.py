@@ -8,13 +8,14 @@ from split_scores import score_rows
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
 MODE = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CMP_MODE", "loftr")
+WIN = os.environ.get("WIN", "5")
 MODELS = [("v18e10", "ours, v18 epoch 10"), ("splatt3r", "Splatt3R (public)")]
 VIDEOS = ["video1", "video2", "video3", "video4"]
 
 
 def scores(m, v):
     tag = "" if v == "video1" else "_" + v
-    p = os.path.join(OUT, "%s%s_hold12b3w5_%s" % (m, tag, MODE), "loc", "scores.json")
+    p = os.path.join(OUT, "%s%s_hold12b3w%s_%s" % (m, tag, WIN, MODE), "loc", "scores.json")
     try:
         return json.load(open(p)).get("gscpe")
     except Exception:
@@ -104,5 +105,5 @@ if loc_k:
         L.extend(block)
 L.append("=" * W)
 text = "\n".join(L)
-open(os.path.join(OUT, "splatt3r_vs_ours%s.txt" % ("" if MODE == "loftr" else "_" + MODE)), "w").write(text + "\n")
+open(os.path.join(OUT, "splatt3r_vs_ours%s%s.txt" % ("" if MODE == "loftr" else "_" + MODE, "" if WIN == "5" else "_w" + WIN)), "w").write(text + "\n")
 print(text)

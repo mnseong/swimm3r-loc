@@ -12,7 +12,7 @@ for V in ${VIDEOS:-video1 video2 video3 video4}; do
     if [ "$RMODE" = common ]; then
       R="data/$V/ref.json"
       [ -f "$R" ] || { echo "[cmp] no $R, $V skipped"; continue; }
-      LG="$OUT/log_${M}_${V}_moved.txt"
+      LG="$OUT/log_${M}_${V}_moved$([ "${WIN:-5}" = 5 ] || echo "_w$WIN").txt"
       SCENE="data/$V" HOLD=12 BLOCK=3 HOLD_MAP=moved REF="$R" REF_LOCAL="${REF_LOCAL:-10}" TRT="${TRT:-1}" bash run.sh "$M" "$OUT" --gscpe --gscpe_no_ablation "${@:2}" > "$LG" 2>&1
     else
       LG="$OUT/log_${M}_${V}.txt"
