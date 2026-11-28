@@ -96,6 +96,7 @@ if [ "$HOLD" != 0 ]; then
       EXTRA+=(--proto_ref_poses "$REF" --proto_ref_frames 2)
       RDEP="${REF_DEPTH:-${REF%.json}_meta.json}"
       if [ -f "$RDEP" ]; then EXTRA+=(--proto_ref_depth "$RDEP"); echo "reference depth for the percentages: $RDEP"; fi
+      if [ "${REF_LOCAL:-0}" != 0 ]; then EXTRA+=(--proto_ref_local "$REF_LOCAL"); echo "reference moved in query by query by a similarity on the $REF_LOCAL nearest map frames"; fi
     else
       if [ ! -f "$OUT/map_${M}${TAG}_all/scene.pkl" ]; then
         echo "the mapping of all frames, the reference of the queries, is missing: it is made first (EVERY=1)"
@@ -116,6 +117,9 @@ elif [ "${FIXED_SPLIT:-0}" = 1 ]; then
   cp "$SCENE/split.json" "$MP/split.json"
   echo "mapping frames $(wc -l < "$MP/frames.txt") (train_files.txt of $SCENE), queries are the test_files of $SCENE/split.json, pair window $WIN, the reference $REF is moved into the map by a similarity fitted on the map frames"
   EXTRA=(--split_json "$MP/split.json" --proto_ref_poses "$REF" --proto_ref_frames 2)
+  RDEP="${REF_DEPTH:-${REF%.json}_meta.json}"
+  if [ -f "$RDEP" ]; then EXTRA+=(--proto_ref_depth "$RDEP"); echo "reference depth for the percentages: $RDEP"; fi
+  if [ "${REF_LOCAL:-0}" != 0 ]; then EXTRA+=(--proto_ref_local "$REF_LOCAL"); echo "reference moved in query by query by a similarity on the $REF_LOCAL nearest map frames"; fi
   if [ "${TRT:-0}" = 1 ]; then EXTRA+=(--trt_encoder); fi
 elif [ "$EVERY" != 0 ]; then
   if [ "$EVERY" = 1 ]; then MP="$OUT/map_${M}${TAG}_all"; O="$OUT/${M}${TAG}_all"; else MP="$OUT/map_${M}${TAG}_every${EVERY}w${WIN}"; O="$OUT/${M}${TAG}_every${EVERY}w${WIN}"; fi

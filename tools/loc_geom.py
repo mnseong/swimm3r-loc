@@ -163,6 +163,64 @@ def validate_transfer(ref_names, ref_poses, map_names, map_poses, blocks=4):
     return dict(blocks=int(blocks), idx=[i for i, _ in pairs], et=et, er=er, scales=scales)
 
 
+def local_fit(A, Bm, centre, k, skip=()):
+    d = np.linalg.norm(A[:, :3, 3] - np.asarray(centre, dtype=np.float64), axis=1)
+    d[list(skip)] = np.inf
+    near = np.argsort(d, kind="stable")[:min(int(k), int(np.isfinite(d).sum()))]
+    return fit_poses(A[near], Bm[near]), near, d[near]
+
+
+def transfer_poses_local(ref_names, ref_poses, map_names, map_poses, want, k):
+    pos = {n: j for j, n in enumerate(ref_names)}
+    pairs = [(i, pos[n]) for i, n in enumerate(map_names) if n in pos]
+    if len(pairs) < max(3, int(k)):
+        return None
+    rp = np.asarray(ref_poses, dtype=np.float64)
+    A = rp[[j for _, j in pairs]]
+    Bm = np.asarray(map_poses, dtype=np.float64)[[i for i, _ in pairs]]
+    glob = fit_poses(A, Bm)
+    if glob is None:
+        return None
+    common = {map_names[i]: c for c, (i, _) in enumerate(pairs)}
+    out, scales, near_d, far_d, fell = {}, {}, [], [], []
+    for n in want:
+        if n not in pos:
+            continue
+        p = rp[pos[n]]
+        fit, near, d = local_fit(A, Bm, p[:3, 3], k, [common[n]] if n in common else [])
+        if fit is None:
+            fit = glob
+            fell.append(n)
+        s, R, t = fit
+        out[n] = move_pose(s, R, t, p)
+        scales[n] = float(s)
+        near_d.append(float(d[0]))
+        far_d.append(float(d[-1]))
+    return out, dict(n=len(pairs), k=int(k), scale=float(glob[0]), scales=scales, near=near_d, far=far_d, fallback=fell)
+
+
+def validate_transfer_local(ref_names, ref_poses, map_names, map_poses, k):
+    pos = {n: j for j, n in enumerate(ref_names)}
+    pairs = [(i, pos[n]) for i, n in enumerate(map_names) if n in pos]
+    if len(pairs) < int(k) + 1:
+        return None
+    A = np.asarray(ref_poses, dtype=np.float64)[[j for _, j in pairs]]
+    Bm = np.asarray(map_poses, dtype=np.float64)[[i for i, _ in pairs]]
+    et, er, scales = [], [], []
+    for c in range(len(pairs)):
+        fit, _, _ = local_fit(A, Bm, A[c][:3, 3], k, [c])
+        if fit is None:
+            continue
+        s, R, t = fit
+        m = move_pose(s, R, t, A[c])
+        et.append(float(np.linalg.norm(m[:3, 3] - Bm[c][:3, 3])))
+        er.append(angle(m[:3, :3], Bm[c][:3, :3]))
+        scales.append(float(s))
+    if not et:
+        return None
+    return dict(k=int(k), idx=[i for i, _ in pairs], et=et, er=er, scales=scales)
+
+
 def motion(a, b):
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     return float(np.linalg.norm(a[:3, 3] - b[:3, 3])), angle(a[:3, :3], b[:3, :3])

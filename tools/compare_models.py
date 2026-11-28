@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_gscpe import KEY_ROWS
+from split_scores import score_rows
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
 MODE = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CMP_MODE", "loftr")
@@ -52,6 +53,13 @@ for m, lab in MODELS:
         hs.append("%s %s" % (v.replace("video", "v"), "-" if not h else "%.2f %% / %.2f deg" % (h["t_med"], h["r_med"])))
     if any(not x.endswith("-") for x in hs):
         L.append(" reference check, held out map frames, median (%s): %s" % (lab, ", ".join(hs)))
+for m, lab in MODELS:
+    hs = []
+    for v in VIDEOS:
+        h = ((res[(m, v)] or {}).get("fit") or {}).get("holdout")
+        hs.append("%s %s" % (v.replace("video", "v"), "%.2f %% / %.2f deg" % (h["t_p95"], h["r_p95"]) if h and "t_p95" in h else "-"))
+    if any(not x.endswith("-") for x in hs):
+        L.append(" reference check, held out map frames, p95 (%s): %s" % (lab, ", ".join(hs)))
 L.append(" per scene: FPS (1 / mean seconds per query), then queries within 5 % and 5 deg | mean of the four scenes: FPS, within 10/5, 5/5, 2/2, 1/1, median %, deg")
 L.append(" %-38s %-20s %s | %s | %6s %6s %6s %6s %6s %6s %6s" % ("method", "model", " ".join("%5s" % v.replace("video", "v") for v in VIDEOS),
                                                       " ".join("%5s" % v.replace("video", "v") for v in VIDEOS), "FPS", "10/5", "5/5", "2/2", "1/1", "t %", "deg"))
@@ -72,6 +80,27 @@ for lab in KEY_ROWS:
                      " ".join(f(x, "%5.1f") for x in a5), f(mean(fps), "%6.2f"), f(mean(a10), "%6.1f"), f(mean(a5), "%6.1f"), f(mean(a2), "%6.1f"),
                      f(mean(a1), "%6.1f"), f(mean(t), "%6.2f"), f(mean(rr), "%6.2f")))
     if block:
+        L.extend(block)
+loc_k = sorted({(((res[(m, v)] or {}).get("fit") or {}).get("local") or {}).get("k") for m, _ in MODELS for v in VIDEOS} - {None})
+if loc_k:
+    L[4:4] = [" each query reference moved in by a similarity on the %s map frames nearest to it in the reference (chosen from the reference alone)" % "/".join(map(str, loc_k))]
+    L.append("-" * W)
+    L.append(" the same estimates against the reference moved in by one similarity on all map frames: mean of the four scenes, within 10/5, 5/5, 2/2, 1/1, median %, deg")
+    for m, lab in MODELS:
+        hs = []
+        for v in VIDEOS:
+            h = ((res[(m, v)] or {}).get("fit") or {}).get("holdout_global")
+            hs.append("%s %s" % (v.replace("video", "v"), "-" if not h else "%.2f %% / %.2f deg" % (h["t_med"], h["r_med"])))
+        L.append(" reference check with one similarity, held out blocks, median (%s): %s" % (lab, ", ".join(hs)))
+    for lab in KEY_ROWS:
+        block = []
+        for m, name in MODELS:
+            got = [score_rows(res[(m, v)], lab, against="global") if res[(m, v)] else None for v in VIDEOS]
+            if not any(got):
+                continue
+            col = lambda k, i=None: mean([(g[k] if i is None else g[k][i]) if g else None for g in got])
+            block.append(" %-38s %-20s %6s %6s %6s %6s %6s %6s" % (lab if not block else "", name, f(col("acc", 0), "%6.1f"), f(col("acc", 1), "%6.1f"),
+                                                             f(col("acc", 2), "%6.1f"), f(col("acc", 3), "%6.1f"), f(col("t"), "%6.2f"), f(col("r"), "%6.2f")))
         L.extend(block)
 L.append("=" * W)
 text = "\n".join(L)

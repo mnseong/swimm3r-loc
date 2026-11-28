@@ -55,6 +55,9 @@ def run(ctx):
     print("[gscpe] queries: %d held out, %d with a reference pose, %d left out for lack of one | translation in percent of %s %.4f map units" % (
         len(ctx["tests"]), len(tests), len(ctx["tests"]) - len(tests),
         "the reference depth moved into this map (one denominator for every method)" if rf.get("depth_common") else "the median depth of this map", scale), flush=True)
+    if rf.get("local"):
+        print("[gscpe] reference poses of the queries moved in query by query (similarity on the %d nearest map frames in the reference); the same estimates "
+              "are also scored against the one similarity on all map frames (tools/split_scores.py)" % rf["local"]["k"], flush=True)
     depth_m = ctx.get("depth_m")
     n_c = int(ctx.get("coarse_iters", 3))
     eps_t, eps_r = float(ctx.get("eps_t", 0.0002)), float(ctx.get("eps_r", 0.02))

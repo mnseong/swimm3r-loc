@@ -329,6 +329,10 @@ def parser():
                     help="--proto_ref_poses: json with depth_median, the median depth of the frames in the units of the reference; translation "
                          "errors are then given in percent of that depth moved into this map by the fitted scale, one denominator for every "
                          "method, instead of the median depth of this map")
+    ap.add_argument("--proto_ref_local", type=int, default=0,
+                    help="--proto_ref_poses or --proto_ref_scene: move the reference pose of each query into this map by a similarity on the map "
+                         "frames nearest to it in the reference, this many (0: one similarity on all map frames); the queries are then also scored "
+                         "against the one similarity, kept as global_poses in the reference fit")
     ap.add_argument("--device", default="cuda")
     return ap
 
@@ -1163,6 +1167,38 @@ def main():
                     print("[proto] reference check on held out map frames (the similarity fitted on 3 of 4 time blocks, tested on the fourth): %.2f %% median, "
                           "%.2f %% p95, %.2f %% max of depth, %.2f / %.2f / %.2f deg, scale spread %.2f %% over the blocks; accuracy thresholds below this "
                           "are not resolved by the reference" % (hold["t_med"], hold["t_p95"], hold["t_max"], hold["r_med"], hold["r_p95"], hold["r_max"], hold["scale_spread"]), flush=True)
+                if args.proto_ref_local > 0:
+                    kl = int(args.proto_ref_local)
+                    lg = loc_geom.transfer_poses_local(ref_src[0], ref_src[1], list(names), poses_np, tests, kl)
+                    lv = loc_geom.validate_transfer_local(ref_src[0], ref_src[1], list(names), poses_np, kl)
+                    if lg is None or lv is None:
+                        print("[proto] fewer than %d map frames in common with the reference, the one similarity on all map frames is kept" % (kl + 1), flush=True)
+                    else:
+                        den = ref_fit.get("depth_common") or float(np.median(loc.depths))
+                        ref_fit["global_poses"] = dict(ref_poses)
+                        ref_fit["holdout_global"] = ref_fit.pop("holdout", None)
+                        ref_poses, lf = lg
+                        gs = float(lf["scale"])
+                        qs = 100.0 * (np.array(list(lf["scales"].values())) / gs - 1.0)
+                        near, far = 100.0 * gs * np.asarray(lf["near"]) / den, 100.0 * gs * np.asarray(lf["far"]) / den
+                        ref_fit["local"] = dict(k=kl, queries=len(ref_poses), near_med=float(np.median(near)), near_max=float(near.max()),
+                                                far_med=float(np.median(far)), far_max=float(far.max()), scale_p5=float(np.percentile(qs, 5)),
+                                                scale_p95=float(np.percentile(qs, 95)), fallback=len(lf["fallback"]))
+                        lo = ref_fit["local"]
+                        print("[proto] reference moved in query by query: a similarity on the %d map frames nearest to the query in the reference (chosen from the "
+                              "reference poses alone); nearest frame %.2f %% median, %.2f %% max of depth away, the %d th %.2f %% median, %.2f %% max; local scale "
+                              "%.2f %% to %.2f %% (p5 to p95) from the scale on all map frames; %d queries fell back to the one similarity" % (
+                                  kl, lo["near_med"], lo["near_max"], kl, lo["far_med"], lo["far_max"], lo["scale_p5"], lo["scale_p95"], lo["fallback"]), flush=True)
+                        ht, hr = 100.0 * np.asarray(lv["et"]) / den, np.asarray(lv["er"])
+                        ls = 100.0 * (np.asarray(lv["scales"]) / gs - 1.0)
+                        ref_fit["holdout"] = dict(local=kl, n=len(lv["et"]), t_med=float(np.median(ht)), t_p95=float(np.percentile(ht, 95)), t_max=float(ht.max()),
+                                                  r_med=float(np.median(hr)), r_p95=float(np.percentile(hr, 95)), r_max=float(hr.max()),
+                                                  scale_spread=float(np.percentile(ls, 95) - np.percentile(ls, 5)))
+                        hold = ref_fit["holdout"]
+                        print("[proto] reference check on held out map frames (each map frame left out in turn, the similarity fitted on its %d nearest map frames "
+                              "in the reference): %.2f %% median, %.2f %% p95, %.2f %% max of depth, %.2f / %.2f / %.2f deg over %d frames; accuracy thresholds below "
+                              "this are not resolved by the reference" % (kl, hold["t_med"], hold["t_p95"], hold["t_max"], hold["r_med"], hold["r_p95"], hold["r_max"],
+                                                                         hold["n"]), flush=True)
         loc_pub = None
         if args.proto_public:
             from mast3r.model import AsymmetricMASt3R

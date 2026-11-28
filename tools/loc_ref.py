@@ -181,16 +181,32 @@ def reference_lines(fit, text=None, skipped=0):
         out.append("             same frame and intrinsics as the map, nothing moved between reconstructions (focal of the map frames %.2f, of the queries %.2f).%s" % (
             f.get("focal_map", float("nan")), f.get("focal_queries", float("nan")), gone))
     else:
-        out += ["             moved into the map by a similarity fitted on the %d map frames (scale %.3f): after the fit the map frames differ by a median of" % (
-                    f.get("n", 0), f.get("scale", float("nan"))),
+        out += ["             %s on the %d map frames (scale %.3f): after the fit the map frames differ by a median of" % (
+                    "one similarity fitted" if f.get("local") else "moved into the map by a similarity fitted", f.get("n", 0), f.get("scale", float("nan"))),
                 "             %.2f %% of depth and %.2f deg (largest %.2f %%, %.2f deg), which does not bound the error of a query pose.%s" % (
                     f.get("t_med", float("nan")), f.get("r_med", float("nan")), f.get("t_max", float("nan")), f.get("r_max", float("nan")), gone)]
         if f.get("depth_common"):
             out.append("             Depth for the percentages: the median depth of the reference frames %.4f times the scale = %.4f map units, the same for every" % (
                 f["depth_ref"], f["depth_common"]))
             out.append("             method (the median depth of this map would be %.4f)." % f.get("depth_map", float("nan")))
+        lo = f.get("local")
+        if lo:
+            out.append("             Query by query: each reference pose moved in by a similarity on the %d map frames nearest to it in the reference" % lo["k"])
+            out.append("             (chosen from the reference poses alone), the nearest %.2f %% median of depth away, the %d th %.2f %% median, %.2f %% max;" % (
+                lo["near_med"], lo["k"], lo["far_med"], lo["far_max"]))
+            out.append("             local scale %.2f %% to %.2f %% (p5 to p95) from the scale on all map frames, %d queries fell back to the one similarity." % (
+                lo["scale_p5"], lo["scale_p95"], lo["fallback"]))
         h = f.get("holdout")
-        if h:
+        if h and h.get("local"):
+            out.append("             Held out map frames (each left out in turn, similarity on its %d nearest map frames): %.2f %% median, %.2f %% p95, %.2f %% max" % (
+                h["local"], h["t_med"], h["t_p95"], h["t_max"]))
+            out.append("             of depth, %.2f / %.2f / %.2f deg; accuracy thresholds below this are not resolved by the reference." % (
+                h["r_med"], h["r_p95"], h["r_max"]))
+            g = f.get("holdout_global")
+            if g:
+                out.append("             With one similarity on all map frames (3 of %d time blocks): %.2f %% median, %.2f %% p95 of depth, %.2f / %.2f deg." % (
+                    g["blocks"], g["t_med"], g["t_p95"], g["r_med"], g["r_p95"]))
+        elif h:
             out.append("             Held out map frames (similarity fitted on 3 of %d time blocks, tested on the rest): %.2f %% median, %.2f %% p95, %.2f %% max of depth," % (
                 h["blocks"], h["t_med"], h["t_p95"], h["t_max"]))
             out.append("             %.2f / %.2f / %.2f deg, scale spread %.2f %% over the blocks; accuracy thresholds below this are not resolved by the reference." % (
