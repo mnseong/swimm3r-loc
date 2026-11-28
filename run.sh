@@ -7,6 +7,7 @@ OUT="${2:-out}"
 case "$M" in
   v17) W0=ckpt/joint_s3r_v17/weights; H0=ckpt/head_s3r_v17/final_splatt3r.pth; E0=0015 ;;
   v18e10) W0=ckpt/joint_s3r_v18e10/weights; H0=ckpt/head_s3r_v18e10/final_splatt3r.pth; E0=0009 ;;
+  v20) W0=ckpt/joint_s3r_v20/weights; H0=ckpt/head_s3r_v20/final_splatt3r.pth; E0=0019 ;;
   splatt3r) W0=""; H0=""; E0="" ;;
   v13c) W0=ckpt/joint_s3r_v12/weights; H0=ckpt/head_s3r_v13c/final_splatt3r.pth; E0=0019 ;;
   *) W0=""; H0=""; E0=0019 ;;
@@ -24,8 +25,9 @@ TAG="${TAG:+_$TAG}"
 SCENE="${SCENE:-data/video1}"
 SCENE="${SCENE%/}"
 LOC=(--anchor_px 6 --min_conf_thr 0.5 --fps 5 --medium_raster s2 --binf_veil)
+[ "$M" = v20 ] && LOC+=(--light_eval veil)
 case "$M" in
-  v17|v18e10|v13c|splatt3r) ;;
+  v17|v18e10|v20|v13c|splatt3r) ;;
   *) echo "usage: [TAG=name LORA=path PHYS=path HEAD=path EVERY=n HOLD=n REF=poses SCENE=folder FIXED_SPLIT=1] run.sh [v17|v13c] [out_dir] [benchmark options, --proto for the localization protocol, --gscpe for the GS-CPE protocol]"; echo "EVERY=1 maps all frames as the reference, EVERY=4 maps every 4th of all frames and localizes the others"; echo "HOLD=12 BLOCK=3 holds out three consecutive frames in the middle of every 12 as queries (HOLD=4 every 4th frame). HOLD_MAP=register (default): Stage 1 maps the other frames alone and every query is registered into that fixed map for its reference pose; moved: the reference comes from another reconstruction of all frames (REF, or the mapping of all frames) through a similarity; same: one reconstruction of all frames, the queries left out of the Gaussian map only"; echo "SCENE=data/sealoc_s1 (default data/video1) takes the images and splits of another scene folder, its name is added to the output folders. FIXED_SPLIT=1 maps the train_files.txt of the scene and localizes the test_files of its split.json, the reference REF of all frames is moved into the map through a similarity on the map frames (HOLD_MAP=moved)"; exit 1 ;;
 esac
 if [ "$(cd "$SCENE" 2>/dev/null && pwd -P)" != "$(cd "$D/data/video1" 2>/dev/null && pwd -P)" ]; then

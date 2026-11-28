@@ -7,7 +7,7 @@ RMODE="${REF_MODE:-loftr}"
 case "$RMODE" in loftr|common) ;; *) echo "REF_MODE must be loftr or common"; exit 1 ;; esac
 mkdir -p "$OUT"
 for V in ${VIDEOS:-video1 video2 video3 video4}; do
-  for M in v18e10 splatt3r; do
+  for M in ${OURS:-v20} splatt3r; do
     echo "[cmp] $M $V start $(date +%T)"
     if [ "$RMODE" = common ]; then
       R="data/$V/ref.json"

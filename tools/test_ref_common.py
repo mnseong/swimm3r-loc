@@ -65,12 +65,12 @@ def check_lines():
 
 def check_table():
     d = tempfile.mkdtemp(prefix="cmp_")
-    for m in ("v18e10", "splatt3r"):
+    for m in ("v20", "splatt3r"):
         for v in ("video1", "video2", "video3", "video4"):
             tag = "" if v == "video1" else "_" + v
             p = os.path.join(d, "%s%s_hold12b3w5_moved" % (m, tag), "loc")
             os.makedirs(p)
-            names = ["%06d.jpg" % i for i in range(5, 30, 4)] if (m == "v18e10" or v != "video3") else ["%06d.jpg" % i for i in range(5, 26, 4)]
+            names = ["%06d.jpg" % i for i in range(5, 30, 4)] if (m == "v20" or v != "video3") else ["%06d.jpg" % i for i in range(5, 26, 4)]
             row = dict(label="fast + check, TensorRT encoder", acc=[100.0, 90.0, 80.0, 50.0], t=0.8, r=0.4, fps=3.5)
             g = dict(frames=len(names), skipped=7 - len(names), names=names, rows=[row],
                      fit=dict(holdout=dict(t_med=1.1, r_med=0.7)))
@@ -157,7 +157,7 @@ def check_local_lines_and_table(g):
     print("reference lines in the local mode name the neighbours, the leave one out check and the one similarity check %s" % ok)
     assert ok, out
     d = tempfile.mkdtemp(prefix="cmpl_")
-    for m in ("v18e10", "splatt3r"):
+    for m in ("v20", "splatt3r"):
         for v in ("video1", "video2", "video3", "video4"):
             tag = "" if v == "video1" else "_" + v
             p = os.path.join(d, "%s%s_hold12b3w5_moved" % (m, tag), "loc")

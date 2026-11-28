@@ -9,7 +9,8 @@ from split_scores import score_rows
 OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
 MODE = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CMP_MODE", "loftr")
 WIN = os.environ.get("WIN", "5")
-MODELS = [("v18e10", "ours, v18 epoch 10"), ("splatt3r", "Splatt3R (public)")]
+OURS = os.environ.get("OURS", "v20")
+MODELS = [(OURS, {"v20": "ours, v20", "v18e10": "ours, v18 epoch 10"}.get(OURS, "ours, " + OURS)), ("splatt3r", "Splatt3R (public)")]
 VIDEOS = ["video1", "video2", "video3", "video4"]
 
 

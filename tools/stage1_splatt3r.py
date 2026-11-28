@@ -196,6 +196,10 @@ def parser():
                          "as a second map drawn behind the map (and behind the time window). No ray is empty then, and the colour of a "
                          "far region comes from the attenuation and the backscatter at its depth as everywhere else; nothing is taken "
                          "as open water. Old render path only")
+    ap.add_argument("--light_eval", choices=("median", "one", "veil"), default="median",
+                    help="light colour E of a physics head that has one: median (default) multiplies the in air colours of every underwater "
+                         "render by the median E of the map frames; one renders with E = 1; veil also multiplies the dry renders of the veil "
+                         "fit of the medium field by that E (as the v20 evaluation)")
     ap.add_argument("--binf_veil", action="store_true",
                     help="medium field: B_inf is fitted to the map frames themselves through the image formation at the depth of every "
                          "pixel, not to the B_inf of the physics head alone. Where the map has a primitive the frame equals its water "
@@ -437,6 +441,11 @@ def main():
         act = Splatt3RHead.activate(raw)
         med = None if phys is None else medium(phys, feat, depth, beta_D_scale=args.phys_beta_D_scale)
         light_scene = med["light"].median(0).values if (med is not None and "light" in med) else None
+        if light_scene is not None and args.light_eval == "one":
+            print(f"[s3r] light colour E {[round(float(x), 4) for x in light_scene]} of the map frames is not used, the renders take E = 1", flush=True)
+            light_scene = None
+        if light_scene is not None and args.light_eval == "veil":
+            print("[s3r] the veil fit of the medium field renders the in air colours times the light colour E", flush=True)
         if light_scene is not None:
             print(f"[s3r] light colour of the water column: E per channel {[round(float(x), 4) for x in light_scene]} (median of the map frames), "
                   f"it multiplies the in air colours in every underwater render", flush=True)
@@ -660,7 +669,8 @@ def main():
                         cu_ = c2w[i].clone()
                         cu_[:3, 3] = c2w[i, :3, 3] * unit
                         fi_, ci_ = float(intr[i, 0, 0]), (float(intr[i, 0, 2]) + 0.5, float(intr[i, 1, 2]) + 0.5)
-                        one_ = lambda gm_: (render_view_beta(gm_["means"], gm_["opacity"], gm_["scales"], gm_["quat"], gm_["J"], cu_, fi_, h, w,
+                        one_ = lambda gm_: (render_view_beta(gm_["means"], gm_["opacity"], gm_["scales"], gm_["quat"],
+                                                             gm_["J"] * light_scene[None] if (light_scene is not None and args.light_eval == "veil") else gm_["J"], cu_, fi_, h, w,
                                                              torch.zeros(3, device=dev), pp=ci_, betas=gm_["beta"], scale_factor=K_BETA4, eps2d=EPS2D_BETA4)
                                             if "beta" in gm_ else
                                             render_view(gm_["means"], gm_["opacity"], gm_["scales"], gm_["quat"], gm_["J"], cu_, fi_, h, w,
