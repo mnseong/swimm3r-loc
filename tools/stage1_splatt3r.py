@@ -1159,10 +1159,10 @@ def main():
                     ref_fit["holdout"] = dict(blocks=hv["blocks"], t_med=float(np.median(ht)), t_p95=float(np.percentile(ht, 95)), t_max=float(ht.max()),
                                               r_med=float(np.median(hr)), r_p95=float(np.percentile(hr, 95)), r_max=float(hr.max()),
                                               scale_spread=float(100.0 * (max(hv["scales"]) - min(hv["scales"])) / np.mean(hv["scales"])))
-                    h = ref_fit["holdout"]
+                    hold = ref_fit["holdout"]
                     print("[proto] reference check on held out map frames (the similarity fitted on 3 of 4 time blocks, tested on the fourth): %.2f %% median, "
                           "%.2f %% p95, %.2f %% max of depth, %.2f / %.2f / %.2f deg, scale spread %.2f %% over the blocks; accuracy thresholds below this "
-                          "are not resolved by the reference" % (h["t_med"], h["t_p95"], h["t_max"], h["r_med"], h["r_p95"], h["r_max"], h["scale_spread"]), flush=True)
+                          "are not resolved by the reference" % (hold["t_med"], hold["t_p95"], hold["t_max"], hold["r_med"], hold["r_p95"], hold["r_max"], hold["scale_spread"]), flush=True)
         loc_pub = None
         if args.proto_public:
             from mast3r.model import AsymmetricMASt3R
